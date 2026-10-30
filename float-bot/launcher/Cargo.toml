@@ -1,0 +1,11 @@
+[package]
+name = "float_bot_launcher"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bot_bouee"
+path = "src/main.rs"
+
+[dependencies]
+hudhook = { version = "0.9.3", default-features = false, features = ["inject"] }
