@@ -20,6 +20,8 @@ lanceur, sans aucun fichier du jeu modifié.
 
 À refaire à chaque lancement du jeu.
 
+Marche avec les versions 0.7.35 (celle des records de speedrun) et 0.8.0 du jeu.
+
 ## Touches
 
 | Touche | Action |
@@ -33,9 +35,10 @@ lanceur, sans aucun fichier du jeu modifié.
 | F7 | Effets VHS / caméra off |
 | F8 | Afficher les murs invisibles |
 | F9 | Afficher les zones / triggers |
+| F11 | Caméra libre (le joueur reste sur place, ZQSD / Espace / Ctrl / Shift déplacent la vue) |
 
 Sans touche par défaut (assignables) : stamina infinie, items infinis, désactiver le TP anti-chute,
-slot précédent, slot suivant.
+slot précédent, slot suivant, fins de niveau (`fins_niveau`).
 
 Les touches se changent dans `libbackrooms_practice_tool.cfg`, créé à côté de la DLL au premier
 lancement (lignes `action = TOUCHE`, vide = pas de touche). Noms possibles : F1-F12, A-Z, 0-9,
@@ -47,8 +50,11 @@ modification.
 **HUD** (toujours affiché) : position X/Y/Z, temps de la partie, temps passé en l'air avant le TP
 anti-chute du jeu (5 s sans sol dessous) et options actives.
 
-- **Joueur** : noclip, god mode, stamina / oxygène infinis, pas d'anxiété, vitesse de déplacement,
-  hauteur de saut, désactiver le TP anti-chute.
+- **Joueur** : noclip, caméra libre, god mode, stamina / oxygène infinis, pas d'anxiété, vitesse de
+  déplacement, hauteur de saut, désactiver le TP anti-chute.
+  - Caméra libre : le joueur reste figé, sans tourner (sa capsule s'affiche en blanc). La souris et
+    les touches du vol ne bougent que la vue, au moment de l'image. La bouée portée et l'aperçu du drop restent donc calculés depuis la vraie
+    position du joueur.
 - **Monde / visuel** : vitesse du jeu (0.1x – 2x, pour apprendre un timing au ralenti), effets VHS
   et post-process off, luminosité.
 - **Hitbox / colliders** : affiche les vraies collisions autour de toi, avec la forme réelle des
@@ -57,15 +63,43 @@ anti-chute du jeu (5 s sans sol dessous) et options actives.
   - bleu : collision du décor et des objets (option « + décor et objets »)
   - jaune : zone / trigger, avec son nom de près
   - rouge : TP, sortie, dégâts, changement de niveau
+  - violet (option « Fins de niveau ») : tout ce qui termine le niveau, visible de n'importe où avec
+    son nom. Ce sont les zones de sortie (y compris celles qui marchent au contact), la porte de
+    fin du Fun Level (il faut FunDoorKey) et les objets de fin qu'on utilise avec E. Une zone de
+    sortie se déclenche avec n'importe quel collider du joueur, pas seulement son corps.
   - Seul ce qui bloque vraiment le joueur est dessiné.
-- **Bouée (Poolrooms)** : quand tu portes une bouée, une sphère montre où elle apparaîtra si tu la
-  lâches maintenant (calcul fait par la fonction de drop du jeu), et un trait montre où elle tombe.
-  - vert : elle reste à cette hauteur (sur le toit)
+- **Bouée (Poolrooms)** : dans la technique du record (saopy, 38,5 s), on monte en lâchant la bouée
+  (Q). Elle apparaît dans le personnage et le pousse vers le haut : on saute dessus et on la reprend
+  aussitôt (E) : elle monte avec soi. On appuie de nouveau sur Q **pendant** la traversée du
+  plafond : elle apparaît alors au niveau du toit et y reste, la corne au-dessus. Depuis le toit,
+  on la vise et on la reprend (E). Lâchée depuis le haut de l'arche, sous le plafond, elle est
+  éjectée et tombe.
+  - Après chaque lâcher, son trajet est tracé en violet, et le HUD indique où elle a fini : tombée,
+    restée sous le toit (à X cm) ou contre le toit (récupérable d'en haut).
+  - « dans toi » dans l'étiquette : elle apparaîtra dans ton corps et te poussera.
+  - La vraie forme de la bouée (corne comprise) est dessinée là où elle apparaîtra : en vert si elle
+    dépassera du toit, en rouge si elle restera dessous. L'étiquette donne l'écart en cm.
+  - Une fois lâchée, elle reste dessinée en violet à travers le toit pendant 60 s, pour viser.
+  - Tant que tu la portes, elle reste attachée à toi et te suit partout, même à travers un plafond.
+  Quand tu portes une bouée, une sphère montre où elle apparaîtra si tu la lâches maintenant (calcul
+  fait par la fonction de drop du jeu), et un trait montre où elle tombe. Elle apparaît à hauteur
+  de tes pieds + dropHeight, devant toi, sinon à droite, derrière ou à gauche. C'est l'orientation
+  de ton corps qui compte, pas celle de la caméra, et l'étiquette indique le côté.
+  - vert : elle reste à cette hauteur (pas forcément sur le toit)
   - orange : dans le décor, ou petite chute
   - rouge : elle retombe dans la salle
+- **Glitch d'inspection** : inspecter un objet (inventaire, clic droit, Inspect) fait apparaître une
+  copie solide de l'objet 10 cm devant la caméra, toujours orientée selon les axes du monde. Le jeu
+  repousse alors le joueur hors de l'objet, parfois à travers une grille ou des rideaux. Plus
+  l'objet est gros, plus la poussée est forte : la ProtectionSuit (bouton pour se la donner).
+  - cyan : la forme réelle de l'objet, là où il apparaîtra si tu inspectes maintenant. Il faut
+    l'avoir inspecté une fois pour que l'outil connaisse sa forme.
+  - blanc : ta capsule de collision.
+  - Après chaque inspection, le HUD et le jeu affichent la poussée mesurée (distance, direction
+    avant/droite/haut). Vert si tu as traversé un mur, orange sinon.
 - **Positions (savestates)** : sauve position, rotation, vie / stamina / oxygène / anxiété et inventaire. Une savestate faite en
   portant la bouée te la remet dans les mains au chargement (slot marqué « + bouee »).
-- **Sorties / points du niveau** : scanne le niveau et liste sorties, ascenseurs et triggers, avec
+- **Sorties / points du niveau** : scanne le niveau et liste sorties, portes et objets de fin, ascenseurs et triggers, avec
   un bouton pour s'y téléporter. Attention : aller sur une sortie peut finir le niveau.
 - **Entités** : liste des entités avec leur distance, téléportation, on/off une par une.
 - **Items** : donne n'importe quel item, items infinis.

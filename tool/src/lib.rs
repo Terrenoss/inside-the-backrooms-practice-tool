@@ -75,6 +75,8 @@ impl Overlay {
                     "anti_chute_off" => flip(&NO_FALL_TP),
                     "slot_precedent" => s.selected = s.selected.saturating_sub(1),
                     "slot_suivant" => s.selected = (s.selected + 1).min(s.slots.len().saturating_sub(1)),
+                    "fins_niveau" => s.show_exits = !s.show_exits,
+                    "camera_libre" => s.free_cam = !s.free_cam,
                     _ => {},
                 }
             }
@@ -134,6 +136,7 @@ impl ImguiRenderLoop for Overlay {
             .build(|| {
                 let flags: Vec<&str> = [
                     (NOCLIP.load(Relaxed), "NOCLIP"),
+                    (s.free_cam, "CAMERA LIBRE"),
                     (GOD.load(Relaxed), "GOD"),
                     (s.inf_stamina, "STAMINA"),
                     (INF_ITEMS.load(Relaxed), "ITEMS"),
@@ -163,6 +166,12 @@ impl ImguiRenderLoop for Overlay {
                     if let Some(d) = s.drop {
                         ui.text_colored(d.color(), format!("Drop bouee : {}", d.label()));
                     }
+                    if let Some(p) = s.push.filter(|p| p.recent()) {
+                        ui.text_colored(p.color(), format!("Inspection : {}", p.label()));
+                    }
+                    if let Some(l) = s.landed.filter(|l| l.recent()) {
+                        ui.text_colored(l.color(), format!("Bouee lachee : {}", l.label()));
+                    }
                 }
             });
 
@@ -185,6 +194,9 @@ impl ImguiRenderLoop for Overlay {
                     atomic_checkbox(ui, &format!("Noclip / vol{}", hk(1)), &NOCLIP);
                     ui.slider("Vitesse vol", 1.0, 50.0, &mut s.fly_speed);
                     ui.text_disabled("ZQSD, Espace monte, Ctrl descend, Shift x3");
+                    ui.checkbox(format!("Camera libre{}", hk(15)), &mut s.free_cam);
+                    ui.text_disabled("Le joueur reste fige, sans tourner (capsule blanche) :");
+                    ui.text_disabled("la souris et les touches du vol bougent la camera.");
                     atomic_checkbox(ui, &format!("God mode{}", hk(2)), &GOD);
                     ui.checkbox(format!("Stamina infinie{}", hk(9)), &mut s.inf_stamina);
                     ui.checkbox("Oxygene infini", &mut s.inf_oxygen);
@@ -215,11 +227,13 @@ impl ImguiRenderLoop for Overlay {
                     ui.same_line();
                     ui.checkbox("+ decor et objets", &mut s.show_visible_walls);
                     ui.checkbox(format!("Zones / triggers{}", hk(8)), &mut s.show_triggers);
+                    ui.checkbox(format!("Fins de niveau{}", hk(14)), &mut s.show_exits);
                     ui.slider("Rayon (m)", 5.0, 60.0, &mut s.collider_radius);
                     ui.text_colored([1.0, 0.55, 0.0, 1.0], "orange : mur invisible (BoundsCollider...)");
                     ui.text_colored([0.35, 0.75, 1.0, 1.0], "bleu : vraie collision du decor / objets");
                     ui.text_colored([1.0, 0.95, 0.2, 1.0], "jaune : zone (son nom s'affiche de pres)");
                     ui.text_colored([1.0, 0.2, 0.2, 1.0], "rouge : TP / sortie / degats / niveau...");
+                    ui.text_colored([1.0, 0.3, 1.0, 1.0], "violet : ce qui finit le niveau, vu de loin");
                     ui.text_disabled("Ce que le joueur traverse n'est pas affiche.");
                     ui.text_disabled("Distorsion / VHS coupes pendant l'affichage.");
                     if s.show_colliders || s.show_triggers {
@@ -229,16 +243,60 @@ impl ImguiRenderLoop for Overlay {
                             ui.text_disabled(format!("({} en forme approx.)", s.approx_count));
                         }
                     }
+                    if s.show_exits {
+                        ui.text_disabled(format!("{} fins de niveau chargees", s.exit_count));
+                    }
                 }
 
                 if section(ui, "Bouee (Poolrooms)", false) {
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "Record (saopy) : Q, puis E aussitot : elle monte");
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "avec toi. Q de nouveau EN traversant le plafond :");
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "elle reste dans le toit, reprends-la d'en haut (E).");
+                    ui.text_disabled("Pour le timing : Monde / visuel > Vitesse du jeu.");
+                    ui.text_disabled("Forme rouge : elle restera sous le toit. Une fois");
+                    ui.text_disabled("lachee, elle reste dessinee en violet (60 s) avec");
+                    ui.text_disabled("son trajet, et l'outil dit ou elle a fini (HUD).");
                     ui.checkbox("Previsualiser le drop", &mut s.drop_preview);
                     ui.text_disabled("Quand tu portes une bouee : la sphere montre ou elle");
                     ui.text_disabled("apparait si tu laches maintenant, le trait ou elle tombe.");
-                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : elle reste a cette hauteur (toit)");
+                    ui.text_disabled("Elle apparait a hauteur de tes pieds + dropHeight,");
+                    ui.text_disabled("devant toi, sinon a droite, derriere ou a gauche");
+                    ui.text_disabled("(selon ton corps, pas ta camera).");
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : elle reste a cette hauteur");
                     ui.text_colored([1.0, 0.6, 0.1, 1.0], "orange : dans le decor ou petite chute");
+                    ui.text_disabled("\"dans toi\" : elle apparait dans ton corps et te pousse.");
+                    if let Some(l) = s.landed {
+                        ui.text_colored(l.color(), format!("Dernier lacher : {}", l.label()));
+                    }
                     ui.text_colored([1.0, 0.2, 0.2, 1.0], "rouge : elle retombe (dans la salle)");
                     ui.text_disabled("Une savestate faite en portant la bouee te la rend.");
+                }
+
+                if section(ui, "Glitch d'inspection", false) {
+                    ui.checkbox("Apercu de l'objet inspecte", &mut s.inspect_preview);
+                    ui.text_disabled("Inspecter un objet le fait apparaitre 10 cm devant la");
+                    ui.text_disabled("camera, solide et toujours oriente pareil (axes du");
+                    ui.text_disabled("monde) : le jeu te repousse hors de lui, parfois a");
+                    ui.text_disabled("travers une grille. Gros objet = grosse poussee.");
+                    if s.items.iter().any(|n| n == "ProtectionSuit") && ui.small_button("Donner ProtectionSuit") {
+                        s.actions.push(Action::Give("ProtectionSuit".into()));
+                    }
+                    if s.inspect_solid == Some(false) {
+                        ui.text_colored([1.0, 0.3, 0.3, 1.0], "Ici les objets inspectes ne touchent pas le joueur.");
+                    }
+                    if s.inspect_item.is_empty() {
+                        ui.text_colored([1.0, 0.8, 0.2, 1.0], "Inspecte l'objet une fois pour voir sa forme");
+                        ui.text_colored([1.0, 0.8, 0.2, 1.0], "(inventaire, clic droit, Inspect).");
+                    } else {
+                        ui.text(format!("Objet : {}", s.inspect_item));
+                        ui.text_colored([0.2, 0.9, 1.0, 1.0], "cyan : ou il apparait si tu inspectes maintenant");
+                        ui.text_colored([1.0, 1.0, 1.0, 1.0], "blanc : ta capsule de collision");
+                    }
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : la poussee a traverse un mur");
+                    ui.text_colored([1.0, 0.6, 0.1, 1.0], "orange : poussee sans traverser");
+                    if let Some(p) = s.push {
+                        ui.text_colored(p.color(), format!("Derniere : {}", p.label()));
+                    }
                 }
 
                 if section(ui, "Positions (savestates)", true) {
