@@ -1,0 +1,11 @@
+[package]
+name = "backrooms_practice_launcher"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "backrooms_practice_tool"
+path = "src/main.rs"
+
+[dependencies]
+hudhook = { version = "0.9.3", default-features = false, features = ["inject"] }

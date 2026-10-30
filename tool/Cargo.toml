@@ -1,0 +1,11 @@
+[package]
+name = "backrooms_practice_tool"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "libbackrooms_practice_tool"
+crate-type = ["cdylib"]
+
+[dependencies]
+hudhook = { version = "0.9.3", default-features = false, features = ["dx11", "dx12"] }
