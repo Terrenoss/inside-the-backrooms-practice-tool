@@ -641,6 +641,14 @@ pub struct State {
     pub push_settle: f32,
     pub push_wall_probe: f32,
     pub push_shown: f32,
+    /// What the push drawing shows: capsule where it started, capsule now (or at the end), arrow
+    /// between them, the body's path, the wall's faces, the real copy while inspecting.
+    pub show_push_ghost: bool,
+    pub show_push_body: bool,
+    pub show_push_arrow: bool,
+    pub show_push_trail: bool,
+    pub show_push_wall: bool,
+    pub show_push_copy: bool,
     push_n: usize,
     /// Whether an inspection was open last frame.
     push_was_open: bool,
@@ -746,6 +754,11 @@ pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         push_settle: 1.5,
         push_wall_probe: 1.5,
         push_shown: 15.0,
+        show_push_ghost: true,
+        show_push_body: true,
+        show_push_arrow: true,
+        show_push_trail: true,
+        show_push_wall: true,
         line_width: 1.5,
         ..Default::default()
     })
@@ -2521,12 +2534,63 @@ unsafe fn draw_inspect(g: &G, s: &mut State, vp: &Mat4) {
     if let Some(p) = s.push_recent() {
         let to = *p.trail.last().unwrap_or(&p.from);
         let color = p.verdict().map_or([1.0; 4], |v| v.color());
-        world_line(&mut lines, vp, p.from, to, color);
-        for (a, b) in capsule_shape(to, p.radius, p.height, 1).edges {
-            world_line(&mut lines, vp, a, b, color);
+        if s.show_push_ghost {
+            for (a, b) in capsule_shape(p.from, p.radius, p.height, 1).edges {
+                world_line(&mut lines, vp, a, b, [0.8, 0.8, 0.8, 0.45]);
+            }
         }
-        if let Some(at) = vp.project(to) {
-            labels.push((at, p.verdict().map_or("...", |v| v.label()).to_string(), color));
+        if s.show_push_body {
+            for (a, b) in capsule_shape(to, p.radius, p.height, 1).edges {
+                world_line(&mut lines, vp, a, b, color);
+            }
+            if let Some(at) = vp.project(to) {
+                labels.push((at, p.hud(), color));
+            }
+        }
+        if s.show_push_arrow && p.from.dist(to) > 0.02 {
+            let dir = to.sub(p.from).scale(1.0 / p.from.dist(to));
+            let side = AXES[1].cross(dir);
+            let side = if side.len() < 1e-3 { p.frame.right } else { side.scale(1.0 / side.len()) };
+            let head = to.add_scaled(dir, -0.06);
+            for (a, b) in [(p.from, to), (to, head.add_scaled(side, 0.04)), (to, head.add_scaled(side, -0.04))] {
+                world_line(&mut lines, vp, a, b, color);
+            }
+        }
+        if s.show_push_trail {
+            for w in p.trail.windows(2) {
+                world_line(&mut lines, vp, w[0], w[1], [1.0, 1.0, 1.0, 0.6]);
+            }
+        }
+        if let Some(w) = p.wall.filter(|_| s.show_push_wall) {
+            // Each face as a 50 cm square across the push, at the capsule center's height.
+            let grey = [0.75, 0.75, 0.75, 0.9];
+            for (i, dist) in [w.near, w.far].into_iter().enumerate() {
+                let c = p.from.add_scaled(p.frame.fwd, -dist);
+                let (r, u) = (p.frame.right.scale(0.25), AXES[1].scale(0.25));
+                let q = [c.add_scaled(r, 1.0).add_scaled(u, 1.0), c.add_scaled(r, -1.0).add_scaled(u, 1.0), c.add_scaled(r, -1.0).add_scaled(u, -1.0), c.add_scaled(r, 1.0).add_scaled(u, -1.0)];
+                for k in 0..4 {
+                    world_line(&mut lines, vp, q[k], q[(k + 1) % 4], grey);
+                }
+                if i == 0 {
+                    if let Some(at) = vp.project(c.add_scaled(u, 1.2)) {
+                        labels.push((at, format!("mur : epaisseur {:.0} cm", w.thickness() * 100.0), grey));
+                    }
+                }
+            }
+        }
+    }
+    // The real copy where the game put it, turning with the mouse, while the inspection is open.
+    if let Some(ins) = g.insp.as_ref().filter(|_| s.show_push_copy) {
+        let ui = call!(ins.singleton, fn() -> P);
+        let pivot: P = if alive(ui) && call!(ins.is_inspecting, fn() -> bool) { rd(ui, ins.off_pivot) } else { std::ptr::null_mut() };
+        if alive(pivot) {
+            let m = call!(g.tr_matrix, fn(P) -> Mat4, pivot);
+            for (in_pivot, shape) in &s.inspect_shapes {
+                let m = m.mul(in_pivot);
+                for &(a, b) in &shape.edges {
+                    world_line(&mut lines, vp, m.apply(a), m.apply(b), [0.6, 0.8, 1.0, 1.0]);
+                }
+            }
         }
     }
     s.lines.extend(lines);

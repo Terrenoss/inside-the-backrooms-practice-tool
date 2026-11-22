@@ -185,6 +185,30 @@ impl PushRecord {
         self.settled.map(|settled| verdict(self.open, settled, self.wall.as_ref(), self.crossed))
     }
 
+    /// One line for the HUD and the label next to the body.
+    pub(crate) fn hud(&self) -> String {
+        let o = self.open;
+        let mut t = format!(
+            "#{} {:.0} deg {} | ouverture : recul {:.2} monte {:.2} cote {:+.2}",
+            self.n,
+            self.pitch,
+            self.pose.label(),
+            o.back,
+            o.up,
+            o.side
+        );
+        let Some(settled) = self.settled else { return t + " | bilan..." };
+        t += &format!(" | bilan : recul {:.2}", settled.back);
+        if let (Some(w), Some(d)) = (self.wall, self.depth(settled)) {
+            let at = if d >= 0.0 { format!("dans le mur {:.0} cm", d * 100.0) } else { format!("a {:.0} cm du mur", -d * 100.0) };
+            t += &format!(" | {at} / ep. {:.0} cm", w.thickness() * 100.0);
+        }
+        if let Some(v) = self.verdict() {
+            t += &format!(" | {}", v.label());
+        }
+        t
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(from: V3, frame: Frame, wall: Option<Wall>) -> PushRecord {
         PushRecord {
@@ -268,6 +292,22 @@ mod tests {
         // l'arriere de la capsule est 0,27 + 0,3 - 0,3 = 0,27 m dans le mur
         assert!((r.depth(r.settled.unwrap()).unwrap() - 0.27).abs() < 1e-5);
         assert_eq!(r.verdict(), Some(Verdict::Reste));
+    }
+
+    #[test]
+    fn hud_line() {
+        let f = Frame::from_camera_right(V3 { x: 1.0, y: 0.0, z: 0.0 });
+        let mut r = PushRecord::new_for_test(V3::default(), f, Some(Wall { near: 0.45, far: 0.85 }));
+        (r.n, r.pitch, r.pose, r.radius) = (3, 62.0, Pose::Allonge, 0.3);
+        r.open = Split { back: 0.27, up: 0.0, side: 0.0 };
+        assert!(r.hud().ends_with("| bilan..."), "{}", r.hud());
+        r.finish(V3 { x: 0.0, y: 0.0, z: -0.27 }, Instant::now());
+        assert_eq!(
+            r.hud(),
+            "#3 62 deg allonge | ouverture : recul 0.27 monte 0.00 cote +0.00 | bilan : recul 0.27 | dans le mur 12 cm / ep. 40 cm | reste en arriere"
+        );
+        r.wall = None;
+        assert!(!r.hud().contains("dans le mur"));
     }
 
     #[test]
