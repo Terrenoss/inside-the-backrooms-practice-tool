@@ -1,0 +1,11 @@
+[package]
+name = "float_bot"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "float_bot"
+crate-type = ["cdylib"]
+
+[dependencies]
+hudhook = { version = "0.9.3", default-features = false }
