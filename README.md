@@ -35,9 +35,9 @@ Marche avec les versions 0.7.35 (celle des records de speedrun) et 0.8.0 du jeu.
 | F4 | Désactiver toutes les entités |
 | F5 | Savestate : sauver |
 | F6 | Savestate : charger le slot sélectionné |
-| F7 | Effets VHS / caméra off |
-| F8 | Afficher les murs invisibles |
-| F9 | Afficher les zones / triggers |
+| F7 | Couper / remettre tous les effets de caméra (VHS, flou, grain…) |
+| F8 | Afficher / cacher les murs invisibles (et le décor s'il était affiché) |
+| F9 | Afficher les zones et les TP / sorties / dégâts (ensemble) |
 | F11 | Caméra libre (le joueur reste sur place, ZQSD / Espace / Ctrl / Shift déplacent la vue) |
 
 Sans touche par défaut (assignables) : stamina infinie, items infinis, désactiver le TP anti-chute,
@@ -55,21 +55,33 @@ anti-chute du jeu (5 s sans sol dessous), sommet de la bouée posée et options 
 
 - **Joueur** : noclip, caméra libre, god mode, stamina / oxygène infinis, pas d'anxiété, vitesse de
   déplacement, hauteur de saut, désactiver le TP anti-chute.
-  - Caméra libre : le joueur reste figé, sans tourner (sa capsule s'affiche en blanc). La souris et
-    les touches du vol ne bougent que la vue, au moment de l'image. La bouée portée et l'aperçu du drop restent donc calculés depuis la vraie
-    position du joueur.
-- **Monde / visuel** : vitesse du jeu (0.1x – 2x, pour apprendre un timing au ralenti), effets VHS
-  et post-process off, luminosité, débloquer tous les niveaux dans la sélection de niveau (rien n'est
+  - Caméra libre : la souris et les touches du vol (ZQSD, Shift, Espace) ne bougent que la vue,
+    au moment de l'image. Le perso ne marche plus, mais le jeu le bouge encore (poussée, gravité,
+    s'allonger). Sa capsule s'affiche en blanc. La bouée portée, l'aperçu du drop et l'aperçu
+    d'inspection restent calculés depuis sa vraie tête.
+- **Monde / visuel** : vitesse du jeu (0.1x – 2x, pour apprendre un timing au ralenti), effets de
+  caméra (bouton « Tout couper » / F7, ou une case par effet : vignette, aberration, flou de mouvement,
+  panini, grain, flou de profondeur, vision trouble, basse résolution, VHS de la caméra, distorsion,
+  VHS du jeu), post-process du niveau off, luminosité, débloquer tous les niveaux dans la sélection de niveau (rien n'est
   sauvegardé : ni fichier, ni statistique Steam ; utile en 0.7.0, qui garde les déblocages dans les
   stats Steam du compte). En 0.7.0, le bouton « Debloquer pour de bon tous les niveaux » (à confirmer,
   en pleine partie) fait pour chaque niveau ce que fait le jeu quand on l'atteint : sa statistique
   « REACH_… » passe à 1 dans tes stats Steam, et le niveau reste ouvert sans le tool.
 - **Hitbox / colliders** : affiche les vraies collisions autour de toi, avec la forme réelle des
   meshes et pas seulement des boîtes.
-  - orange : mur invisible
-  - bleu : collision du décor et des objets (option « + décor et objets »)
-  - jaune : zone / trigger, avec son nom de près
-  - rouge : TP, sortie, dégâts, changement de niveau
+  - Une case par type, indépendante des autres :
+    - orange : mur invisible ;
+    - bleu : collision du décor et des objets ;
+    - jaune : zone ;
+    - rouge : TP, sortie, dégâts, changement de niveau.
+  - **Noms :** une case par type pour afficher le nom à côté de chaque hitbox, avec ce qu'elle est
+    (« mur invisible : BoundsCollider »).
+    - Distance réglable (15 m par défaut).
+    - « + forme et couche » ajoute par exemple « [Mesh, couche 0] ».
+    - « Nom de la hitbox visee » affiche le nom de celle sous le viseur (aussi dans le HUD, « Vise : … »).
+    - « Seulement celle visee » cache les autres noms.
+  - « Couper panini / VHS / distorsion pendant les hitbox » (active par défaut) : ces effets
+    déforment l'image et décalent les traits.
   - violet (option « Fins de niveau ») : tout ce qui termine le niveau, visible de n'importe où avec
     son nom. Ce sont les zones de sortie (y compris celles qui marchent au contact), la porte de
     fin du Fun Level (il faut FunDoorKey) et les objets de fin qu'on utilise avec E. Une zone de

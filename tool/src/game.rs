@@ -560,6 +560,11 @@ struct Info {
     kind: Kind,
     label: String,
     shape: Shape,
+    /// GameObject name, collider type ("Box", "Mesh"... empty for a level end without collider)
+    /// and layer (-1 then), for the hitbox names.
+    name: String,
+    shape_kind: &'static str,
+    layer: i32,
 }
 
 #[derive(Clone)]
@@ -602,7 +607,11 @@ pub struct State {
     pub time_scale: f32,
     pub speed_mult: f32,
     pub jump_mult: f32,
-    pub fx_off: bool,
+    /// Camera effects cut one by one (order of FX_NAMES / off_fx), and the game's own VHS volume.
+    pub fx_cut: [bool; 10],
+    pub fx_game_vhs: bool,
+    /// Cut panini / VHS / distortion while hitboxes are drawn (they warp the image off the lines).
+    pub hitbox_unwarp: bool,
     pub level_post_off: bool,
     pub brightness: f32,
     pub restore_inventory: bool,
@@ -652,10 +661,28 @@ pub struct State {
     push_n: usize,
     /// Whether an inspection was open last frame.
     push_was_open: bool,
+    /// Invisible walls (orange), scenery and objects (blue), zones (yellow), special triggers
+    /// (red: teleport, exit, damage, level change), level ends (violet): each on its own.
     pub show_colliders: bool,
     pub show_visible_walls: bool,
     pub show_triggers: bool,
+    pub show_specials: bool,
     pub show_exits: bool,
+    /// Whether the scenery was shown when F8 last hid the walls (F8 brings it back with them).
+    decor_before_f8: bool,
+    /// Names drawn next to the hitboxes of each kind, up to label_dist (m); "+ shape and layer";
+    /// the one under the crosshair (also in the HUD), and that one only.
+    pub label_invisible: bool,
+    pub label_solid: bool,
+    pub label_trigger: bool,
+    pub label_special: bool,
+    pub label_exit: bool,
+    pub label_dist: f32,
+    pub label_shape: bool,
+    pub label_aimed: bool,
+    pub label_only_aimed: bool,
+    /// The hitbox under the crosshair this frame: its label and color.
+    pub aimed: Option<(String, [f32; 4])>,
     pub collider_radius: f32,
     pub actions: Vec<Action>,
     pub slots: Vec<Saved>,
@@ -744,6 +771,13 @@ pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         applied_mults: (1.0, 1.0),
         restore_inventory: true,
         collider_radius: 25.0,
+        hitbox_unwarp: true,
+        label_invisible: true,
+        label_trigger: true,
+        label_special: true,
+        label_exit: true,
+        label_dist: 15.0,
+        label_aimed: true,
         drop_preview: true,
         show_float: true,
         show_trail: true,
@@ -764,7 +798,57 @@ pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
     })
 });
 
+/// The camera effects off_fx holds, in its order, for the menu.
+pub const FX_NAMES: [&str; 10] = [
+    "Vignette",
+    "Aberration chromatique",
+    "Flou de mouvement",
+    "Panini",
+    "Grain",
+    "Flou de profondeur",
+    "Vision trouble",
+    "Basse resolution",
+    "VHS (camera)",
+    "Distorsion",
+];
+
 impl State {
+    pub fn fx_all_cut(&self) -> bool {
+        self.fx_cut.iter().all(|&c| c) && self.fx_game_vhs
+    }
+
+    /// F7 / "Tout couper": cuts everything unless it all is already, then brings it all back.
+    pub fn toggle_fx_all(&mut self) {
+        let cut = !self.fx_all_cut();
+        (self.fx_cut, self.fx_game_vhs) = ([cut; 10], cut);
+    }
+
+    /// F8: hides invisible walls and scenery together, then brings back the walls and the scenery
+    /// if it was on, as when scenery could only show with the invisible walls.
+    pub fn toggle_walls(&mut self) {
+        if self.show_colliders || self.show_visible_walls {
+            self.decor_before_f8 = self.show_visible_walls;
+            (self.show_colliders, self.show_visible_walls) = (false, false);
+        } else {
+            (self.show_colliders, self.show_visible_walls) = (true, self.decor_before_f8);
+        }
+    }
+
+    /// F9: zones and special triggers together, as before they had their own boxes.
+    pub fn toggle_zones(&mut self) {
+        let on = !(self.show_triggers || self.show_specials);
+        (self.show_triggers, self.show_specials) = (on, on);
+    }
+
+    /// Whether the nearby colliders need scanning (level ends have their own scan).
+    pub fn scans_colliders(&self) -> bool {
+        self.show_colliders || self.show_visible_walls || self.show_triggers || self.show_specials
+    }
+
+    pub fn any_hitboxes(&self) -> bool {
+        self.scans_colliders() || self.show_exits
+    }
+
     /// The push to show: being measured, or closed less than push_settle + push_shown seconds ago.
     pub fn push_recent(&self) -> Option<&PushRecord> {
         let shown = self.push_settle + self.push_shown;
@@ -1671,7 +1755,18 @@ unsafe fn describe(g: &G, col: P, k: P, player: Option<(P, i32)>, budget: &mut u
         Kind::Solid
     };
     let shape = if kind == Kind::Ignored { Shape::default() } else { shape(g, col, k, budget)? };
-    Some(Info { kind, label, shape })
+    Some(Info { kind, label, shape, name, shape_kind: shape_kind_name(g, k), layer })
+}
+
+/// The collider's type in a word, for the hitbox names.
+fn shape_kind_name(g: &G, k: P) -> &'static str {
+    match k {
+        k if k == g.k_box => "Box",
+        k if k == g.k_sphere => "Sphere",
+        k if k == g.k_capsule => "Capsule",
+        k if k == g.k_mesh => "Mesh",
+        _ => "autre",
+    }
 }
 
 const AXES: [V3; 3] = [V3 { x: 1.0, y: 0.0, z: 0.0 }, V3 { x: 0.0, y: 1.0, z: 0.0 }, V3 { x: 0.0, y: 0.0, z: 1.0 }];
@@ -1957,7 +2052,13 @@ unsafe fn scan_colliders(g: &G, s: &mut State, ctrl: P, pos: V3) {
                     Some(sphere_shape(V3::default(), MARKER_RADIUS))
                 };
                 let Some(drawn) = drawn else { continue }; // sampling budget spent: next scan
-                cache(&mut s.infos, key, Info { kind: Kind::Exit, label: label.clone(), shape: drawn })
+                let (name, shape_kind, layer) = if collider {
+                    let go = call!(g.comp_gameobject, fn(P) -> P, obj);
+                    (name_of(g, go), shape_kind_name(g, (il2cpp::api().object_get_class)(obj)), call!(g.go_layer, fn(P) -> i32, go))
+                } else {
+                    (String::new(), "", -1)
+                };
+                cache(&mut s.infos, key, Info { kind: Kind::Exit, label: label.clone(), shape: drawn, name, shape_kind, layer })
             },
         };
         if !info.shape.edges.is_empty() {
@@ -1965,7 +2066,7 @@ unsafe fn scan_colliders(g: &G, s: &mut State, ctrl: P, pos: V3) {
         }
     }
     s.exit_count = out.len();
-    for c in if s.show_colliders || s.show_triggers { find(g, g.t_collider) } else { Vec::new() } {
+    for c in if s.scans_colliders() { find(g, g.t_collider) } else { Vec::new() } {
         let k = (il2cpp::api().object_get_class)(c);
         if k == g.k_character || !call!(g.col_enabled, fn(P) -> bool, c) || ends.iter().any(|e| e.0 == c) {
             continue;
@@ -2019,7 +2120,8 @@ unsafe fn draw(g: &G, s: &mut State, cam: P) {
     s.lines.clear();
     s.polys.clear();
     s.labels.clear();
-    let hitboxes = s.show_colliders || s.show_triggers || s.show_exits;
+    let hitboxes = s.any_hitboxes();
+    s.aimed = None;
     let inspect = s.inspect_preview && !s.inspect_shapes.is_empty() || s.push_recent().is_some();
     // From the free camera, the player's own body usually isn't drawn: show where it is.
     let body = s.capsule.filter(|_| s.applied_free_cam);
@@ -2032,10 +2134,12 @@ unsafe fn draw(g: &G, s: &mut State, cam: P) {
     if !hitboxes && s.drop.is_none() && !inspect && body.is_none() && dropped.is_none() && s.trials.is_empty() {
         return;
     }
-    let eye = call!(g.tr_get_pos, fn(P) -> V3, call!(g.comp_transform, fn(P) -> P, cam));
+    let cam_tr = call!(g.comp_transform, fn(P) -> P, cam);
+    let eye = call!(g.tr_get_pos, fn(P) -> V3, cam_tr);
+    let aim = Ray { origin: eye, dir: call!(g.tr_forward, fn(P) -> V3, cam_tr) };
     let vp = call!(g.cam_proj, fn(P) -> Mat4, cam).mul(&call!(g.cam_view, fn(P) -> Mat4, cam));
     if hitboxes {
-        draw_colliders(g, s, eye, &vp);
+        draw_colliders(g, s, eye, aim, &vp);
     }
     if let Some(d) = s.drop {
         draw_drop(s, &vp, d);
@@ -2611,16 +2715,49 @@ unsafe fn draw_inspect(g: &G, s: &mut State, vp: &Mat4) {
     s.labels.extend(labels);
 }
 
-unsafe fn draw_colliders(g: &G, s: &mut State, eye: V3, vp: &Mat4) {
+/// Whether colliders of this kind are drawn.
+fn kind_wanted(kind: Kind, s: &State) -> bool {
+    match kind {
+        Kind::Solid => s.show_visible_walls,
+        Kind::Invisible => s.show_colliders,
+        Kind::Trigger => s.show_triggers,
+        Kind::Special => s.show_specials,
+        Kind::Exit => s.show_exits,
+        Kind::Ignored => false,
+    }
+}
+
+/// Whether the names of this kind are drawn around (the aimed one is shown regardless).
+fn label_wanted(kind: Kind, s: &State) -> bool {
+    !s.label_only_aimed
+        && match kind {
+            Kind::Solid => s.label_solid,
+            Kind::Invisible => s.label_invisible,
+            Kind::Trigger => s.label_trigger,
+            Kind::Special => s.label_special,
+            Kind::Exit => s.label_exit,
+            Kind::Ignored => false,
+        }
+}
+
+/// "mur invisible : BoundsCollider [Box, couche 0]": what a hitbox is, in words.
+fn collider_label(kind: Kind, label: &str, name: &str, shape: &str, layer: i32, with_shape: bool) -> String {
+    let base = match kind {
+        Kind::Invisible => format!("mur invisible : {name}"),
+        Kind::Solid => format!("decor : {name}"),
+        Kind::Trigger => format!("zone : {name}"),
+        Kind::Special | Kind::Exit | Kind::Ignored => label.to_string(),
+    };
+    if with_shape && !shape.is_empty() { format!("{base} [{shape}, couche {layer}]") } else { base }
+}
+
+/// `aim`: the view's ray, for the hitbox under the crosshair.
+unsafe fn draw_colliders(g: &G, s: &mut State, eye: V3, aim: Ray, vp: &Mat4) {
+    // (distance along the aim, label, color) of the nearest drawn collider under the crosshair.
+    let mut aimed: Option<(f32, String, [f32; 4])> = None;
     for col in &s.colliders {
         let info = &col.info;
-        let wanted = match info.kind {
-            Kind::Solid => s.show_colliders && s.show_visible_walls,
-            Kind::Invisible => s.show_colliders,
-            Kind::Trigger | Kind::Special => s.show_triggers,
-            Kind::Exit => s.show_exits,
-            Kind::Ignored => false,
-        };
+        let wanted = kind_wanted(info.kind, s);
         // Level ends are few and wanted from afar; the rest only around the player.
         let exit = info.kind == Kind::Exit;
         let radius = if exit { f32::INFINITY } else { s.collider_radius };
@@ -2662,12 +2799,29 @@ unsafe fn draw_colliders(g: &G, s: &mut State, eye: V3, vp: &Mat4) {
                 }
             }
         }
+        let text = || collider_label(info.kind, &info.label, &info.name, info.shape_kind, info.layer, s.label_shape);
         // Names only up close, or they pile up into an unreadable mess.
-        if !info.label.is_empty() && (exit || col.bounds.center.dist(eye) < radius.min(15.0)) {
+        if label_wanted(info.kind, s) && (exit || col.bounds.center.dist(eye) < radius.min(s.label_dist)) {
             if let Some(p) = vp.project(col.bounds.center) {
-                s.labels.push((p, info.label.clone(), alpha(1.0)));
+                s.labels.push((p, text(), alpha(1.0)));
             }
         }
+        // A level end without a collider (a marker) can't be raycast.
+        if s.label_aimed && !info.shape_kind.is_empty() {
+            let mut hit = Hit::default();
+            let reach = if exit { 1000.0 } else { radius };
+            if call!(g.col_raycast, fn(P, Ray, *mut Hit, f32) -> bool, col.obj as P, aim, &mut hit, reach)
+                && aimed.as_ref().is_none_or(|a| hit.distance < a.0)
+            {
+                aimed = Some((hit.distance, text(), alpha(1.0)));
+            }
+        }
+    }
+    if let Some((d, text, color)) = aimed {
+        if let Some(p) = vp.project(aim.origin.add_scaled(aim.dir, d)) {
+            s.labels.push((p, format!("> {text}"), color));
+        }
+        s.aimed = Some((text, color));
     }
 }
 
@@ -3043,7 +3197,7 @@ unsafe fn tick(g: &G, ctrl: P) {
     run_repeat(g, s, ctrl, tr, carried, identity, player_layer);
 
     s.camera = cam as usize;
-    if s.show_colliders || s.show_triggers || s.show_exits {
+    if s.any_hitboxes() {
         let here = s.pos;
         if s.last_scan.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
             scan_colliders(g, s, ctrl, here);
@@ -3191,13 +3345,13 @@ unsafe fn visuals(g: &G, cam: P) {
 
     // paniniProjection, vhsEffect, lensDistortion in off_fx: they warp the image away from the hitbox lines.
     const WARPING_FX: [usize; 3] = [3, 8, 9];
-    let hitboxes = s.show_colliders || s.show_triggers || s.show_exits;
+    let hitboxes = s.any_hitboxes();
     for (i, &off) in g.off_fx.iter().enumerate() {
         let c = rd::<P>(cam, off);
         if c.is_null() {
             continue;
         }
-        if s.fx_off || (hitboxes && WARPING_FX.contains(&i)) {
+        if s.fx_cut.get(i).copied().unwrap_or(false) || (s.hitbox_unwarp && hitboxes && WARPING_FX.contains(&i)) {
             s.fx_saved.entry(c as usize).or_insert_with(|| rd(c, g.off_active));
             wr(c, g.off_active, false);
         } else if let Some(active) = s.fx_saved.remove(&(c as usize)) {
@@ -3210,7 +3364,7 @@ unsafe fn visuals(g: &G, cam: P) {
     let mgr = call!(g.bm_singleton, fn() -> P);
     let info = if alive(mgr) { call!(g.bm_level_info, fn(P) -> P, mgr) } else { std::ptr::null_mut() };
     let level_post = if info.is_null() { std::ptr::null_mut() } else { rd::<P>(info, g.off_level_post) };
-    override_weight(g, &mut s.vhs_saved, vhs, s.fx_off);
+    override_weight(g, &mut s.vhs_saved, vhs, s.fx_game_vhs);
     override_weight(g, &mut s.post_saved, level_post, s.level_post_off);
 
     // Brightness: offset ColorAdjustments.postExposure. The camera may rewrite it, so anything
@@ -3360,6 +3514,61 @@ mod tests {
         assert_eq!(side(0.7, 0.2), "a droite");
         assert_eq!(side(-0.7, 0.2), "a gauche");
         assert_eq!(side(0.01, -0.02), "au-dessus de toi");
+    }
+
+    #[test]
+    fn f7_cuts_all_then_restores() {
+        let mut s = State::default();
+        s.fx_cut[3] = true; // one already cut: F7 cuts the rest
+        s.toggle_fx_all();
+        assert!(s.fx_all_cut() && s.fx_game_vhs);
+        s.toggle_fx_all();
+        assert!(s.fx_cut.iter().all(|c| !c) && !s.fx_game_vhs);
+    }
+
+    #[test]
+    fn f8_hides_and_brings_back_walls_and_decor_as_before() {
+        let mut s = State::default();
+        (s.show_colliders, s.show_visible_walls) = (true, true);
+        s.toggle_walls(); // F8: hides orange and blue, like when blue needed orange on
+        assert!(!s.show_colliders && !s.show_visible_walls);
+        s.toggle_walls(); // F8 again: orange back, blue back only because it was on
+        assert!(s.show_colliders && s.show_visible_walls);
+        s.show_visible_walls = false;
+        s.toggle_walls();
+        s.toggle_walls();
+        assert!(s.show_colliders && !s.show_visible_walls);
+    }
+
+    #[test]
+    fn f9_toggles_zones_and_specials_together() {
+        let mut s = State::default();
+        s.show_specials = true; // one on: F9 turns both off
+        s.toggle_zones();
+        assert!(!s.show_triggers && !s.show_specials);
+        s.toggle_zones();
+        assert!(s.show_triggers && s.show_specials);
+    }
+
+    #[test]
+    fn decor_drawn_without_invisible_walls() {
+        let mut s = State::default();
+        s.show_visible_walls = true;
+        assert!(kind_wanted(Kind::Solid, &s) && !kind_wanted(Kind::Invisible, &s));
+        assert!(s.scans_colliders() && s.any_hitboxes());
+        (s.show_visible_walls, s.show_specials) = (false, true);
+        assert!(kind_wanted(Kind::Special, &s) && !kind_wanted(Kind::Trigger, &s));
+        s.label_special = false;
+        assert!(!label_wanted(Kind::Special, &s) && label_wanted(Kind::Invisible, &s) == s.label_invisible);
+    }
+
+    #[test]
+    fn collider_labels() {
+        assert_eq!(collider_label(Kind::Invisible, "", "BoundsCollider", "Box", 0, false), "mur invisible : BoundsCollider");
+        assert_eq!(collider_label(Kind::Solid, "", "Concrete Pillar_24", "Mesh", 0, true), "decor : Concrete Pillar_24 [Mesh, couche 0]");
+        assert_eq!(collider_label(Kind::Trigger, "Zone_A", "Zone_A", "Box", 2, false), "zone : Zone_A");
+        assert_eq!(collider_label(Kind::Special, "TELEPORT (TP1)", "TP1", "Box", 2, true), "TELEPORT (TP1) [Box, couche 2]");
+        assert_eq!(collider_label(Kind::Exit, "SORTIE", "", "", -1, true), "SORTIE");
     }
 
     #[test]

@@ -23,7 +23,7 @@ use hudhook::windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetW
 use hudhook::{Hudhook, ImguiRenderLoop, MessageFilter, RenderContext};
 
 use game::{
-    lineup, lock, spot_count, spread, Action, Outcome, Repeat, Side, FLOAT_COLOR, GOD, INF_ITEMS, NOCLIP,
+    lineup, lock, spot_count, spread, Action, Outcome, Repeat, Side, FLOAT_COLOR, FX_NAMES, GOD, INF_ITEMS, NOCLIP,
     NO_FALL_TP, TURNS, UNLOCK_LEVELS,
 };
 
@@ -71,9 +71,9 @@ impl Overlay {
                     "entites" => s.freeze_entities = !s.freeze_entities,
                     "sauver" => s.actions.push(Action::Save),
                     "charger" => s.actions.push(Action::Load(s.selected)),
-                    "effets_off" => s.fx_off = !s.fx_off,
-                    "colliders" => s.show_colliders = !s.show_colliders,
-                    "triggers" => s.show_triggers = !s.show_triggers,
+                    "effets_off" => s.toggle_fx_all(),
+                    "colliders" => s.toggle_walls(),
+                    "triggers" => s.toggle_zones(),
                     "stamina" => s.inf_stamina = !s.inf_stamina,
                     "items_infinis" => flip(&INF_ITEMS),
                     "anti_chute_off" => flip(&NO_FALL_TP),
@@ -179,6 +179,9 @@ impl ImguiRenderLoop for Overlay {
                         let color = p.verdict().map_or([1.0; 4], |v| v.color());
                         ui.text_colored(color, format!("Inspection {}", p.hud()));
                     }
+                    if let Some((text, color)) = &s.aimed {
+                        ui.text_colored(*color, format!("Vise : {text}"));
+                    }
                     if let Some(l) = s.landed.filter(|l| l.recent()) {
                         ui.text_colored(l.color(), format!("Bouee lachee : {}", l.label()));
                     }
@@ -227,7 +230,16 @@ impl ImguiRenderLoop for Overlay {
                     if ui.small_button("1x") {
                         s.time_scale = 1.0;
                     }
-                    ui.checkbox(format!("Effets VHS / camera off{}", hk(6)), &mut s.fx_off);
+                    let all = s.fx_all_cut();
+                    if ui.button(format!("{}{}", if all { "Tout remettre" } else { "Tout couper" }, hk(6))) {
+                        s.toggle_fx_all();
+                    }
+                    ui.same_line();
+                    ui.text_disabled("effets de camera, un par un :");
+                    for (i, name) in FX_NAMES.iter().enumerate() {
+                        ui.checkbox(format!("Couper : {name}"), &mut s.fx_cut[i]);
+                    }
+                    ui.checkbox("Couper : VHS du jeu", &mut s.fx_game_vhs);
                     ui.checkbox("Post-process du niveau off", &mut s.level_post_off);
                     ui.slider("Luminosite (EV)", 0.0, 8.0, &mut s.brightness);
                     atomic_checkbox(ui, "Debloquer tous les niveaux (selection de niveau)", &UNLOCK_LEVELS);
@@ -252,20 +264,42 @@ impl ImguiRenderLoop for Overlay {
                 }
 
                 if section(ui, "Hitbox / colliders", false) {
+                    let (orange, blue, yellow, red, violet) =
+                        ([1.0, 0.55, 0.0, 1.0], [0.35, 0.75, 1.0, 1.0], [1.0, 0.95, 0.2, 1.0], [1.0, 0.2, 0.2, 1.0], [1.0, 0.3, 1.0, 1.0]);
+                    ui.text_disabled("Afficher (chaque case est independante) :");
                     ui.checkbox(format!("Murs invisibles{}", hk(7)), &mut s.show_colliders);
                     ui.same_line();
-                    ui.checkbox("+ decor et objets", &mut s.show_visible_walls);
-                    ui.checkbox(format!("Zones / triggers{}", hk(8)), &mut s.show_triggers);
+                    ui.text_colored(orange, "orange");
+                    ui.checkbox("Decor et objets", &mut s.show_visible_walls);
+                    ui.same_line();
+                    ui.text_colored(blue, "bleu");
+                    ui.checkbox(format!("Zones{}", hk(8)), &mut s.show_triggers);
+                    ui.same_line();
+                    ui.text_colored(yellow, "jaune");
+                    ui.checkbox(format!("TP / sorties / degats / niveau{}", hk(8)), &mut s.show_specials);
+                    ui.same_line();
+                    ui.text_colored(red, "rouge");
                     ui.checkbox(format!("Fins de niveau{}", hk(14)), &mut s.show_exits);
+                    ui.same_line();
+                    ui.text_colored(violet, "violet, vu de loin");
                     ui.slider("Rayon (m)", 5.0, 60.0, &mut s.collider_radius);
-                    ui.text_colored([1.0, 0.55, 0.0, 1.0], "orange : mur invisible (BoundsCollider...)");
-                    ui.text_colored([0.35, 0.75, 1.0, 1.0], "bleu : vraie collision du decor / objets");
-                    ui.text_colored([1.0, 0.95, 0.2, 1.0], "jaune : zone (son nom s'affiche de pres)");
-                    ui.text_colored([1.0, 0.2, 0.2, 1.0], "rouge : TP / sortie / degats / niveau...");
-                    ui.text_colored([1.0, 0.3, 1.0, 1.0], "violet : ce qui finit le niveau, vu de loin");
+                    ui.text_disabled("Noms affiches a cote :");
+                    ui.checkbox("murs invisibles##nom", &mut s.label_invisible);
+                    ui.same_line();
+                    ui.checkbox("decor##nom", &mut s.label_solid);
+                    ui.same_line();
+                    ui.checkbox("zones##nom", &mut s.label_trigger);
+                    ui.checkbox("TP / sorties##nom", &mut s.label_special);
+                    ui.same_line();
+                    ui.checkbox("fins de niveau##nom", &mut s.label_exit);
+                    ui.slider("Distance des noms (m)", 2.0, 60.0, &mut s.label_dist);
+                    ui.checkbox("+ forme et couche", &mut s.label_shape);
+                    ui.checkbox("Nom de la hitbox visee (viseur, aussi dans le HUD)", &mut s.label_aimed);
+                    ui.checkbox("Seulement celle visee", &mut s.label_only_aimed);
+                    ui.checkbox("Couper panini / VHS / distorsion pendant les hitbox", &mut s.hitbox_unwarp);
+                    ui.text_disabled("(sinon ces effets deforment l'image et les traits se decalent)");
                     ui.text_disabled("Ce que le joueur traverse n'est pas affiche.");
-                    ui.text_disabled("Distorsion / VHS coupes pendant l'affichage.");
-                    if s.show_colliders || s.show_triggers {
+                    if s.any_hitboxes() {
                         ui.text_disabled(format!("{} colliders proches", s.collider_count));
                         if s.approx_count > 0 {
                             ui.same_line();
@@ -401,8 +435,6 @@ impl ImguiRenderLoop for Overlay {
                         ui.text_colored([0.2, 0.9, 1.0, 1.0], "cyan : ou il apparait si tu inspectes maintenant");
                         ui.text_colored([1.0, 1.0, 1.0, 1.0], "blanc : ta capsule de collision");
                     }
-                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : la poussee a traverse un mur");
-                    ui.text_colored([1.0, 0.6, 0.1, 1.0], "orange : poussee sans traverser");
                     ui.separator();
                     ui.text("Mesure de la poussee");
                     ui.checkbox("Capsule de depart", &mut s.show_push_ghost);
