@@ -715,7 +715,6 @@ pub struct State {
     cam_pitch: f32,
     /// Mouse look taken from the player (InputLookDir) for the free camera.
     look_input: [f32; 2],
-    pin_pos: V3,
     cam_saved: Option<(V3, Quat)>,
     applied_freeze: bool,
     applied_time_scale: f32,
@@ -953,6 +952,9 @@ struct G {
     off_spawned: usize,
     off_vars: Vec<usize>, // speeds then jumpForce (last)
     off_look_dir: usize,
+    /// PlayerController inputs the free camera's keys must not reach: (InputMoveDir,
+    /// InputRunningHold, m_WaitingToJumpRelease). None if a version renamed one.
+    off_move_inputs: Option<(usize, usize, usize)>,
     off_look_speed: usize,
     off_fx: Vec<usize>,
     off_color_adj: usize,
@@ -1173,6 +1175,9 @@ unsafe fn resolve() -> Result<G, String> {
         off_invuln: f(stats, "m_HasInvulnerability")?,
         off_spawned: f(ents, "SpawnedEntities")?,
         off_look_dir: f(pc, "InputLookDir")?,
+        off_move_inputs: f(pc, "InputMoveDir")
+            .and_then(|m| Ok((m, f(pc, "InputRunningHold")?, f(pc, "m_WaitingToJumpRelease")?)))
+            .ok(),
         off_look_speed: f(vars, "lookSpeed")?,
         off_vars: [
             "walkSpeed", "crawlWalkSpeed", "runSpeed", "jogSpeed", "crouchWalkSpeed", "climbSpeed", "ropeClimbSpeed",
@@ -1373,6 +1378,13 @@ unsafe extern "C-unwind" fn pc_update(this: P, mi: usize) {
             let d: [f32; 2] = rd(this, g().off_look_dir);
             s.look_input = [s.look_input[0] + d[0], s.look_input[1] + d[1]];
             wr(this, g().off_look_dir, [0.0f32; 2]);
+            // ZQSD / Shift / Space fly the free camera: the body doesn't walk, run or jump with them,
+            // but the game still moves it otherwise (the inspect push, gravity, crawling).
+            if let Some((mv, run, jump_wait)) = g().off_move_inputs {
+                wr(this, mv, [0.0f32; 2]);
+                wr(this, run, false);
+                wr(this, jump_wait, true); // JumpCheck waits for Space to be released first
+            }
         }
     }
     orig(this, mi);
@@ -2729,7 +2741,7 @@ unsafe fn tick(g: &G, ctrl: P) {
     if free_cam && !s.applied_free_cam {
         s.cam_pos = call!(g.tr_get_pos, fn(P) -> V3, cam_tr);
         (s.cam_yaw, s.cam_pitch) = yaw_pitch_of(call!(g.tr_forward, fn(P) -> V3, cam_tr));
-        (s.pin_pos, s.look_input) = (pos, [0.0; 2]);
+        s.look_input = [0.0; 2];
     }
     if !free_cam {
         if let Some((p, r)) = s.cam_saved.take().filter(|_| alive(cam)) {
@@ -2764,7 +2776,7 @@ unsafe fn tick(g: &G, ctrl: P) {
             s.fly_pos = s.fly_pos.add_scaled(step, 1.0);
         }
     }
-    let hold = if noclip { Some(s.fly_pos) } else if free_cam { Some(s.pin_pos) } else { None };
+    let hold = noclip.then_some(s.fly_pos);
     if let Some(p) = hold {
         // The CharacterController moved us during Update; override it and push the change to physics.
         call!(g.tr_set_pos, fn(P, V3), tr, p);
