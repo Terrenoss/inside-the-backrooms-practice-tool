@@ -668,6 +668,8 @@ pub struct State {
     pub show_triggers: bool,
     pub show_specials: bool,
     pub show_exits: bool,
+    /// Whether the scenery was shown when F8 last hid the walls (F8 brings it back with them).
+    decor_before_f8: bool,
     /// Names drawn next to the hitboxes of each kind, up to label_dist (m); "+ shape and layer";
     /// the one under the crosshair (also in the HUD), and that one only.
     pub label_invisible: bool,
@@ -819,6 +821,17 @@ impl State {
     pub fn toggle_fx_all(&mut self) {
         let cut = !self.fx_all_cut();
         (self.fx_cut, self.fx_game_vhs) = ([cut; 10], cut);
+    }
+
+    /// F8: hides invisible walls and scenery together, then brings back the walls and the scenery
+    /// if it was on, as when scenery could only show with the invisible walls.
+    pub fn toggle_walls(&mut self) {
+        if self.show_colliders || self.show_visible_walls {
+            self.decor_before_f8 = self.show_visible_walls;
+            (self.show_colliders, self.show_visible_walls) = (false, false);
+        } else {
+            (self.show_colliders, self.show_visible_walls) = (true, self.decor_before_f8);
+        }
     }
 
     /// F9: zones and special triggers together, as before they had their own boxes.
@@ -3511,6 +3524,20 @@ mod tests {
         assert!(s.fx_all_cut() && s.fx_game_vhs);
         s.toggle_fx_all();
         assert!(s.fx_cut.iter().all(|c| !c) && !s.fx_game_vhs);
+    }
+
+    #[test]
+    fn f8_hides_and_brings_back_walls_and_decor_as_before() {
+        let mut s = State::default();
+        (s.show_colliders, s.show_visible_walls) = (true, true);
+        s.toggle_walls(); // F8: hides orange and blue, like when blue needed orange on
+        assert!(!s.show_colliders && !s.show_visible_walls);
+        s.toggle_walls(); // F8 again: orange back, blue back only because it was on
+        assert!(s.show_colliders && s.show_visible_walls);
+        s.show_visible_walls = false;
+        s.toggle_walls();
+        s.toggle_walls();
+        assert!(s.show_colliders && !s.show_visible_walls);
     }
 
     #[test]

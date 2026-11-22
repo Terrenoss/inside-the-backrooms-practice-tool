@@ -36,7 +36,7 @@ Marche avec les versions 0.7.35 (celle des records de speedrun) et 0.8.0 du jeu.
 | F5 | Savestate : sauver |
 | F6 | Savestate : charger le slot sélectionné |
 | F7 | Couper / remettre tous les effets de caméra (VHS, flou, grain…) |
-| F8 | Afficher les murs invisibles |
+| F8 | Afficher / cacher les murs invisibles (et le décor s'il était affiché) |
 | F9 | Afficher les zones et les TP / sorties / dégâts (ensemble) |
 | F11 | Caméra libre (le joueur reste sur place, ZQSD / Espace / Ctrl / Shift déplacent la vue) |
 

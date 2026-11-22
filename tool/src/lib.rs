@@ -72,7 +72,7 @@ impl Overlay {
                     "sauver" => s.actions.push(Action::Save),
                     "charger" => s.actions.push(Action::Load(s.selected)),
                     "effets_off" => s.toggle_fx_all(),
-                    "colliders" => s.show_colliders = !s.show_colliders,
+                    "colliders" => s.toggle_walls(),
                     "triggers" => s.toggle_zones(),
                     "stamina" => s.inf_stamina = !s.inf_stamina,
                     "items_infinis" => flip(&INF_ITEMS),
