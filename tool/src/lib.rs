@@ -123,7 +123,7 @@ impl ImguiRenderLoop for Overlay {
                 dl.add_polyline(p.pts.iter().map(|&q| to_screen(q)).collect(), p.color).filled(true).build();
             }
             for l in &s.lines {
-                dl.add_line(to_screen(l.a), to_screen(l.b), l.color).thickness(1.5).build();
+                dl.add_line(to_screen(l.a), to_screen(l.b), l.color).thickness(s.line_width).build();
             }
             for (p, label, color) in &s.labels {
                 let [x, y] = to_screen(*p);
@@ -379,6 +379,8 @@ impl ImguiRenderLoop for Overlay {
 
                 if section(ui, "Glitch d'inspection", false) {
                     ui.checkbox("Apercu de l'objet inspecte", &mut s.inspect_preview);
+                    ui.slider("Remplissage de l'objet", 0.0, 0.8, &mut s.inspect_fill);
+                    ui.slider("Epaisseur des traits", 1.0, 5.0, &mut s.line_width);
                     ui.text_disabled("Inspecter un objet le fait apparaitre 10 cm devant la");
                     ui.text_disabled("camera, solide et toujours oriente pareil (axes du");
                     ui.text_disabled("monde) : le jeu te repousse hors de lui, parfois a");

@@ -71,6 +71,13 @@ impl Quat {
         ])
     }
 
+    /// `v` turned by this rotation (q * v * q^-1).
+    fn rotate(self, v: V3) -> V3 {
+        let [x, y, z, w] = self.0;
+        let t = V3 { x: 2.0 * (y * v.z - z * v.y), y: 2.0 * (z * v.x - x * v.z), z: 2.0 * (x * v.y - y * v.x) };
+        V3 { x: v.x + w * t.x + (y * t.z - z * t.y), y: v.y + w * t.y + (z * t.x - x * t.z), z: v.z + w * t.z + (x * t.y - y * t.x) }
+    }
+
     /// Normalized lerp along the shortest way: plenty for two close aims.
     fn nlerp(self, o: Quat, t: f32) -> Quat {
         let dot: f32 = (0..4).map(|k| self.0[k] * o.0[k]).sum();
@@ -659,6 +666,10 @@ pub struct State {
     pub unlock_confirm: bool,
     pub unlock_msg: Option<String>,
     pub inspect_preview: bool,
+    /// Opacity of the inspected item's faces in the preview.
+    pub inspect_fill: f32,
+    /// Width of every overlay line, in pixels.
+    pub line_width: f32,
     /// Name of the last inspected item, whose pooled copy the preview draws ("" before any).
     pub inspect_item: String,
     /// Whether inspected items (INSPECT_LAYER) are solid for the player.
@@ -763,6 +774,8 @@ pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         show_trail: true,
         skip_right: true,
         inspect_preview: true,
+        inspect_fill: 0.3,
+        line_width: 1.5,
         ..Default::default()
     })
 });
@@ -2381,9 +2394,16 @@ unsafe fn draw_inspect(g: &G, s: &mut State, vp: &Mat4) {
     let (mut lines, mut polys, mut labels) = (Vec::new(), Vec::new(), Vec::new());
     let cam = call!(g.player_camera, fn() -> P);
     if s.inspect_preview && !s.inspect_shapes.is_empty() && alive(cam) {
-        let tr = call!(g.comp_transform, fn(P) -> P, cam);
-        let eye = call!(g.tr_get_pos, fn(P) -> V3, tr);
-        let spawn = eye.add_scaled(call!(g.tr_forward, fn(P) -> V3, tr), INSPECT_DISTANCE);
+        // With the free camera on, the player camera is at the free view while rendering: its real
+        // pose (where the game will spawn the item from) is the one begin_context saved.
+        let (eye, fwd) = match s.cam_saved {
+            Some((p, r)) => (p, r.rotate(AXES[2])),
+            None => {
+                let tr = call!(g.comp_transform, fn(P) -> P, cam);
+                (call!(g.tr_get_pos, fn(P) -> V3, tr), call!(g.tr_forward, fn(P) -> V3, tr))
+            },
+        };
+        let spawn = eye.add_scaled(fwd, INSPECT_DISTANCE);
         // ShowInspectable moves the pivot there with no rotation; the item keeps its place in it.
         let to_spawn = Mat4::translation(spawn);
         let color = [0.2, 0.9, 1.0, 1.0];
@@ -2395,7 +2415,7 @@ unsafe fn draw_inspect(g: &G, s: &mut State, vp: &Mat4) {
             for face in &shape.faces {
                 let pts = clip_front(&face.map(|p| vp.point(m.apply(p))));
                 if pts.len() >= 3 {
-                    polys.push(Poly { pts, color: [color[0], color[1], color[2], 0.1] });
+                    polys.push(Poly { pts, color: [color[0], color[1], color[2], s.inspect_fill] });
                 }
             }
         }
@@ -3291,6 +3311,16 @@ mod tests {
     fn unlock_stats_skip_none_and_duplicates() {
         // (level, its unlock stat): 0 is COMPLETE_TIME, never an unlock stat (the Lobby is always open).
         assert_eq!(unlock_stats(&[(1, 0), (12, 56), (11, 60), (2, 1), (13, 56)]), vec![1, 56, 60]);
+    }
+
+    #[test]
+    fn quat_rotates_vectors() {
+        let q = Quat::yaw(90.0);
+        let f = q.rotate(AXES[2]);
+        assert!(f.dist(AXES[0]) < 1e-5, "{f:?}");
+        let r = yaw_pitch_rotation(30.0, 45.0);
+        let (fwd, _) = yaw_pitch_axes(30.0, 45.0);
+        assert!(r.rotate(AXES[2]).dist(fwd) < 1e-5);
     }
 
     #[test]
