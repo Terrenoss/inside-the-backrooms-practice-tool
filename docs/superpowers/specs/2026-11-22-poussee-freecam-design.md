@@ -194,6 +194,19 @@ Le choix entre (b) et (c) est laissé au builder (§9). La contrainte : la logiq
 3. **Affichage des colliders, quatre cases indépendantes :** murs invisibles, décor et objets, zones, spéciaux (TP, sortie, dégâts, niveau). Plus de case qui dépend d'une autre.
    - **Les touches gardent exactement leur effet actuel** *(choix du concepteur, pour ne rien changer aux habitudes)* : F8 = murs invisibles, F9 = zones **et** spéciaux ensemble.
 
+## 6.7 Déjà présent après la fusion de `float-aids-and-bot` (2026-11-22)
+
+La branche fusionnée apporte une partie de ce plan. On la complète, on ne la refait pas.
+
+- **Caméra libre (F11, `camera_libre`).** Elle est déplacée seulement pour le rendu (`begin_context` / `end_context`), et la souris passe par `InputLookDir`. C'est l'approche (c) du §5. Le §6.2 se limite à ajouter les options qui manquent : souris seulement au clic droit, case « bloquer les controles », cacher la vue d'inspection, « Teleporter le joueur ici », capsule du joueur au choix.
+- **Glitch d'inspection** (section « Glitch d'inspection »), avec `Push` et `track_inspection` :
+  - aperçu cyan de la forme de l'objet là où il apparaîtra (après une première inspection) ;
+  - capsule blanche ;
+  - poussée mesurée (avant, droite, haut) et « A TRAVERSE » si un obstacle solide a été franchi ;
+  - bouton pour se donner la ProtectionSuit.
+
+  Le §6.1 enrichit cet existant : poussée à l'ouverture et au bilan, épaisseur du mur, historique, convention des angles. Le §6.4 y ajoute le calcul de poussée prévue et sa couleur.
+
 ## 7. Ordre de livraison
 
 1. Commit du travail en cours (par le joueur).
