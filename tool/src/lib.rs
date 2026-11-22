@@ -2,6 +2,7 @@
 // (hudhook) and drives the game through its own il2cpp methods (see game.rs).
 mod config;
 mod game;
+mod push;
 mod il2cpp;
 
 use std::ffi::c_void;
@@ -21,7 +22,10 @@ use hudhook::windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use hudhook::windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 use hudhook::{Hudhook, ImguiRenderLoop, MessageFilter, RenderContext};
 
-use game::{lock, Action, GOD, INF_ITEMS, NOCLIP, NO_FALL_TP};
+use game::{
+    lineup, lock, spot_count, spread, Action, Outcome, Repeat, Side, FLOAT_COLOR, GOD, INF_ITEMS, NOCLIP,
+    NO_FALL_TP, TURNS, UNLOCK_LEVELS,
+};
 
 static LOG: OnceLock<PathBuf> = OnceLock::new();
 static INIT_ERROR: OnceLock<String> = OnceLock::new();
@@ -75,6 +79,8 @@ impl Overlay {
                     "anti_chute_off" => flip(&NO_FALL_TP),
                     "slot_precedent" => s.selected = s.selected.saturating_sub(1),
                     "slot_suivant" => s.selected = (s.selected + 1).min(s.slots.len().saturating_sub(1)),
+                    "fins_niveau" => s.show_exits = !s.show_exits,
+                    "camera_libre" => s.free_cam = !s.free_cam,
                     _ => {},
                 }
             }
@@ -118,7 +124,7 @@ impl ImguiRenderLoop for Overlay {
                 dl.add_polyline(p.pts.iter().map(|&q| to_screen(q)).collect(), p.color).filled(true).build();
             }
             for l in &s.lines {
-                dl.add_line(to_screen(l.a), to_screen(l.b), l.color).thickness(1.5).build();
+                dl.add_line(to_screen(l.a), to_screen(l.b), l.color).thickness(s.line_width).build();
             }
             for (p, label, color) in &s.labels {
                 let [x, y] = to_screen(*p);
@@ -134,6 +140,7 @@ impl ImguiRenderLoop for Overlay {
             .build(|| {
                 let flags: Vec<&str> = [
                     (NOCLIP.load(Relaxed), "NOCLIP"),
+                    (s.free_cam, "CAMERA LIBRE"),
                     (GOD.load(Relaxed), "GOD"),
                     (s.inf_stamina, "STAMINA"),
                     (INF_ITEMS.load(Relaxed), "ITEMS"),
@@ -163,6 +170,18 @@ impl ImguiRenderLoop for Overlay {
                     if let Some(d) = s.drop {
                         ui.text_colored(d.color(), format!("Drop bouee : {}", d.label()));
                     }
+                    if let Some(l) = lineup(&s).filter(|_| s.repeat.is_none()) {
+                        let turn = (l.yaw - s.yaw + 540.0).rem_euclid(360.0) - 180.0;
+                        let way = if turn >= 0.0 { "a droite" } else { "a gauche" };
+                        ui.text(format!("Line up : tourne de {:.0} deg {way} (vise {:.0}, toi {:.0})", turn.abs(), l.yaw, s.yaw));
+                    }
+                    if let Some(p) = s.push_recent() {
+                        let color = p.verdict().map_or([1.0; 4], |v| v.color());
+                        ui.text_colored(color, format!("Inspection {}", p.hud()));
+                    }
+                    if let Some(l) = s.landed.filter(|l| l.recent()) {
+                        ui.text_colored(l.color(), format!("Bouee lachee : {}", l.label()));
+                    }
                 }
             });
 
@@ -185,6 +204,9 @@ impl ImguiRenderLoop for Overlay {
                     atomic_checkbox(ui, &format!("Noclip / vol{}", hk(1)), &NOCLIP);
                     ui.slider("Vitesse vol", 1.0, 50.0, &mut s.fly_speed);
                     ui.text_disabled("ZQSD, Espace monte, Ctrl descend, Shift x3");
+                    ui.checkbox(format!("Camera libre{}", hk(15)), &mut s.free_cam);
+                    ui.text_disabled("Le joueur reste fige, sans tourner (capsule blanche) :");
+                    ui.text_disabled("la souris et les touches du vol bougent la camera.");
                     atomic_checkbox(ui, &format!("God mode{}", hk(2)), &GOD);
                     ui.checkbox(format!("Stamina infinie{}", hk(9)), &mut s.inf_stamina);
                     ui.checkbox("Oxygene infini", &mut s.inf_oxygen);
@@ -208,6 +230,25 @@ impl ImguiRenderLoop for Overlay {
                     ui.checkbox(format!("Effets VHS / camera off{}", hk(6)), &mut s.fx_off);
                     ui.checkbox("Post-process du niveau off", &mut s.level_post_off);
                     ui.slider("Luminosite (EV)", 0.0, 8.0, &mut s.brightness);
+                    atomic_checkbox(ui, "Debloquer tous les niveaux (selection de niveau)", &UNLOCK_LEVELS);
+                    if s.unlock_confirm {
+                        ui.text_colored([1.0, 0.8, 0.3, 1.0], "Ecrit dans tes statistiques Steam : definitif.");
+                        if ui.button("Oui, debloquer pour de bon") {
+                            s.actions.push(Action::UnlockLevelsForever);
+                            s.unlock_confirm = false;
+                        }
+                        ui.same_line();
+                        if ui.button("Annuler") {
+                            s.unlock_confirm = false;
+                        }
+                    } else if ui.button("Debloquer pour de bon tous les niveaux") {
+                        s.unlock_confirm = true;
+                    }
+                    ui.text_disabled("Comme les atteindre en jouant. A faire en pleine partie.");
+                    if let Some(m) = &s.unlock_msg {
+                        ui.text(m);
+                    }
+                    ui.text_disabled("Rien n'est sauve : ni fichier ni stats Steam. Rouvre la selection.");
                 }
 
                 if section(ui, "Hitbox / colliders", false) {
@@ -215,11 +256,13 @@ impl ImguiRenderLoop for Overlay {
                     ui.same_line();
                     ui.checkbox("+ decor et objets", &mut s.show_visible_walls);
                     ui.checkbox(format!("Zones / triggers{}", hk(8)), &mut s.show_triggers);
+                    ui.checkbox(format!("Fins de niveau{}", hk(14)), &mut s.show_exits);
                     ui.slider("Rayon (m)", 5.0, 60.0, &mut s.collider_radius);
                     ui.text_colored([1.0, 0.55, 0.0, 1.0], "orange : mur invisible (BoundsCollider...)");
                     ui.text_colored([0.35, 0.75, 1.0, 1.0], "bleu : vraie collision du decor / objets");
                     ui.text_colored([1.0, 0.95, 0.2, 1.0], "jaune : zone (son nom s'affiche de pres)");
                     ui.text_colored([1.0, 0.2, 0.2, 1.0], "rouge : TP / sortie / degats / niveau...");
+                    ui.text_colored([1.0, 0.3, 1.0, 1.0], "violet : ce qui finit le niveau, vu de loin");
                     ui.text_disabled("Ce que le joueur traverse n'est pas affiche.");
                     ui.text_disabled("Distorsion / VHS coupes pendant l'affichage.");
                     if s.show_colliders || s.show_triggers {
@@ -229,16 +272,211 @@ impl ImguiRenderLoop for Overlay {
                             ui.text_disabled(format!("({} en forme approx.)", s.approx_count));
                         }
                     }
+                    if s.show_exits {
+                        ui.text_disabled(format!("{} fins de niveau chargees", s.exit_count));
+                    }
                 }
 
                 if section(ui, "Bouee (Poolrooms)", false) {
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "Record (saopy) : Q, puis E aussitot : elle monte");
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "avec toi. Q de nouveau EN traversant le plafond :");
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "elle reste dans le toit, reprends-la d'en haut (E).");
+                    ui.text_disabled("Pour le timing : Monde / visuel > Vitesse du jeu.");
+                    ui.text_disabled("Forme rouge : elle restera sous le toit. Une fois");
+                    ui.text_disabled("lachee, elle reste dessinee en violet (60 s) avec");
+                    ui.text_disabled("son trajet, et l'outil dit ou elle a fini (HUD).");
                     ui.checkbox("Previsualiser le drop", &mut s.drop_preview);
                     ui.text_disabled("Quand tu portes une bouee : la sphere montre ou elle");
                     ui.text_disabled("apparait si tu laches maintenant, le trait ou elle tombe.");
-                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : elle reste a cette hauteur (toit)");
+                    ui.text_disabled("Elle apparait a hauteur de tes pieds + dropHeight,");
+                    ui.text_disabled("devant toi, sinon a droite, derriere ou a gauche");
+                    ui.text_disabled("(selon ton corps, pas ta camera).");
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : elle reste a cette hauteur");
                     ui.text_colored([1.0, 0.6, 0.1, 1.0], "orange : dans le decor ou petite chute");
+                    ui.text_disabled("\"dans toi\" : elle apparait dans ton corps et te pousse.");
+                    if let Some(l) = s.landed {
+                        ui.text_colored(l.color(), format!("Dernier lacher : {}", l.label()));
+                    }
                     ui.text_colored([1.0, 0.2, 0.2, 1.0], "rouge : elle retombe (dans la salle)");
                     ui.text_disabled("Une savestate faite en portant la bouee te la rend.");
+                    ui.separator();
+                    ui.checkbox("Voir la bouee a travers les murs", &mut s.show_float);
+                    ui.checkbox("Trace apres le lacher (5 s de jeu)", &mut s.show_trail);
+                    ui.text_colored(FLOAT_COLOR, "rose : la bouee posee et son trajet depuis le lacher");
+                    ui.text_disabled("Sommet : son point le plus haut, par rapport au sol");
+                    ui.text_disabled("sous tes pieds. Sur le toit, positif = elle depasse.");
+                    ui.separator();
+                    ui.text("Test en boucle (le bot apprend)");
+                    ui.text_disabled("A chaque essai : recharge, tourne la tete jusqu'au cercle");
+                    ui.text_disabled("vert, lache, puis vise la bouee et fait E une fois en haut.");
+                    ui.text_disabled("Il apprend quel endroit + quel angle de tete marche.");
+                    ui.text_disabled("Slot sur l'arche, bouee en main, sous la gelee, colle devant.");
+                    ui.text_disabled("Pour tout le large de l'arche : un slot a chaque bout, puis");
+                    ui.text_disabled("choisis l'autre bout. Ne touche a rien pendant le test.");
+                    let n_slots = s.slots.len() as i32;
+                    ui.slider("Jusqu'au slot (0 = meme endroit)", 0, n_slots, &mut s.sweep_to);
+                    s.sweep_to = s.sweep_to.clamp(0, n_slots);
+                    ui.checkbox("Ignorer le cercle vert a droite (la bouee y tombe)", &mut s.skip_right);
+                    if s.repeat.is_some() {
+                        let (from, to) = s.run_slots;
+                        let spots = s.slots.get(from).map_or(1, |a| spot_count(a, to.and_then(|i| s.slots.get(i))));
+                        ui.text(format!("Essai {} ({spots} endroits x {TURNS} angles)...", s.trials.len() + 1));
+                        if ui.button("Arreter") {
+                            s.repeat = None;
+                        }
+                    } else if s.slots.get(s.selected).is_some_and(|v| v.float != 0) {
+                        let to = (s.sweep_to > 0).then(|| s.sweep_to as usize - 1).filter(|&i| i != s.selected);
+                        let label = match to {
+                            Some(i) => format!("Lancer de #{} a #{}", s.selected + 1, i + 1),
+                            None => format!("Lancer sur le slot #{}", s.selected + 1),
+                        };
+                        if ui.button(label) {
+                            s.trials.clear();
+                            s.repeat_error = None;
+                            s.run_slots = (s.selected, to);
+                            s.repeat = Some(Repeat::new(s.selected, to));
+                        }
+                    } else {
+                        ui.text_disabled("Selectionne d'abord un slot marque \"+ bouee\".");
+                    }
+                    if let Some(e) = s.repeat_error {
+                        ui.text_colored([1.0, 0.3, 0.3, 1.0], e);
+                    }
+                    if !s.trials.is_empty() {
+                        for o in Outcome::ALL {
+                            let n = s.trials.iter().filter(|t| t.outcome == o).count();
+                            ui.text_colored(o.color(), format!("{n}/{}  {}", s.trials.len(), o.label()));
+                        }
+                        let by_side: Vec<String> = Side::ALL
+                            .iter()
+                            .map(|&side| {
+                                let at = s.trials.iter().filter(|t| t.side == Some(side));
+                                let ok = at.clone().filter(|t| t.outcome == Outcome::Success).count();
+                                format!("{} {ok}/{}", side.label(), at.count())
+                            })
+                            .collect();
+                        ui.text_disabled(format!("Cercle vert : {}", by_side.join(", ")));
+                        if let Some(l) = lineup(&s) {
+                            ui.separator();
+                            ui.text(format!("Meilleur line up : {}/{} reussis", l.own.1, l.own.0));
+                            ui.text(format!("  a {:.0} cm de #{}, tete tournee de {:+.0} deg", l.away * 100.0, s.run_slots.0 + 1, l.turn));
+                            if let Some(side) = l.side {
+                                ui.text(format!("  cercle vert {}", side.label()));
+                            }
+                            ui.text(format!("  a 5 cm ou 3 deg pres : {}/{}", l.zone.1, l.zone.0));
+                            ui.text(format!("Ecart des positions finales de la bouee : {:.0} cm", spread(&l.ends) * 100.0));
+                            ui.text_disabled("Au sol : rond blanc = ou te mettre, fleche = ou regarder,");
+                            ui.text_disabled("croix = ou viser la corne. Le HUD dit de combien tourner.");
+                            if ui.small_button("Sauver le line up comme slot") {
+                                s.slots.push(l.saved);
+                            }
+                        }
+                        ui.text_disabled("Petits ronds au sol : rouge = rate, vert = reussi.");
+                        ui.text_disabled("Ronds en l'air : ou la bouee a fini.");
+                        if s.repeat.is_none() && ui.small_button("Effacer les resultats") {
+                            s.trials.clear();
+                        }
+                    }
+                }
+
+                if section(ui, "Glitch d'inspection", false) {
+                    ui.checkbox("Apercu de l'objet inspecte", &mut s.inspect_preview);
+                    ui.slider("Remplissage de l'objet", 0.0, 0.8, &mut s.inspect_fill);
+                    ui.slider("Epaisseur des traits", 1.0, 5.0, &mut s.line_width);
+                    ui.text_disabled("Inspecter un objet le fait apparaitre 10 cm devant la");
+                    ui.text_disabled("camera, solide et toujours oriente pareil (axes du");
+                    ui.text_disabled("monde) : le jeu te repousse hors de lui, parfois a");
+                    ui.text_disabled("travers une grille. Gros objet = grosse poussee.");
+                    if s.items.iter().any(|n| n == "ProtectionSuit") && ui.small_button("Donner ProtectionSuit") {
+                        s.actions.push(Action::Give("ProtectionSuit".into()));
+                    }
+                    if s.inspect_solid == Some(false) {
+                        ui.text_colored([1.0, 0.3, 0.3, 1.0], "Ici les objets inspectes ne touchent pas le joueur.");
+                    }
+                    if s.inspect_item.is_empty() {
+                        ui.text_colored([1.0, 0.8, 0.2, 1.0], "Inspecte l'objet une fois pour voir sa forme");
+                        ui.text_colored([1.0, 0.8, 0.2, 1.0], "(inventaire, clic droit, Inspect).");
+                    } else {
+                        ui.text(format!("Objet : {}", s.inspect_item));
+                        ui.text_colored([0.2, 0.9, 1.0, 1.0], "cyan : ou il apparait si tu inspectes maintenant");
+                        ui.text_colored([1.0, 1.0, 1.0, 1.0], "blanc : ta capsule de collision");
+                    }
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : la poussee a traverse un mur");
+                    ui.text_colored([1.0, 0.6, 0.1, 1.0], "orange : poussee sans traverser");
+                    ui.separator();
+                    ui.text("Mesure de la poussee");
+                    ui.checkbox("Capsule de depart", &mut s.show_push_ghost);
+                    ui.same_line();
+                    ui.checkbox("Capsule apres", &mut s.show_push_body);
+                    ui.checkbox("Fleche", &mut s.show_push_arrow);
+                    ui.same_line();
+                    ui.checkbox("Trajet", &mut s.show_push_trail);
+                    ui.same_line();
+                    ui.checkbox("Faces du mur", &mut s.show_push_wall);
+                    ui.checkbox("Copie reelle pendant l'inspection", &mut s.show_push_copy);
+                    ui.slider("Bilan apres (s)", 0.5, 5.0, &mut s.push_settle);
+                    ui.slider("Chercher le mur jusqu'a (m)", 0.5, 3.0, &mut s.push_wall_probe);
+                    let mut max = s.push_log_max as i32;
+                    if ui.slider("Lignes d'historique", 5, 100, &mut max) {
+                        s.push_log_max = max.clamp(5, 100) as usize;
+                    }
+                    ui.text_disabled("Regard = degres sous l'horizon (90 = le sol). Carte = ton");
+                    ui.text_disabled("orientation dans le niveau. Recul / monte en metres.");
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : A TRAVERSE");
+                    ui.same_line();
+                    ui.text_colored([1.0, 0.85, 0.2, 1.0], "jaune : reste en arriere");
+                    ui.text_colored([1.0, 0.6, 0.1, 1.0], "orange : recrache");
+                    ui.same_line();
+                    ui.text_colored([1.0, 0.25, 0.25, 1.0], "rouge : te fait monter");
+                    if let Some(p) = &s.push {
+                        let color = p.verdict().map_or([1.0; 4], |v| v.color());
+                        ui.text_colored(color, format!("Derniere : {}", p.hud()));
+                    }
+                    ui.text(format!("Historique ({})", s.push_log.len()));
+                    if !s.push_log.is_empty() {
+                        ui.same_line();
+                        if ui.small_button("Effacer") {
+                            s.push_log.clear();
+                        }
+                    }
+                    let (mut to_slot, mut go) = (None, None);
+                    ui.child_window("push_log").size([0.0, 200.0]).horizontal_scrollbar(true).build(|| {
+                        for (i, p) in s.push_log.iter().enumerate().rev() {
+                            let _id = ui.push_id_usize(i);
+                            if p.start.is_some() {
+                                if ui.small_button("Slot") {
+                                    to_slot = Some(i);
+                                }
+                                ui.same_line();
+                                if ui.small_button("Aller") {
+                                    go = Some(i);
+                                }
+                                ui.same_line();
+                            }
+                            let (color, verdict) = p.verdict().map_or(([1.0; 4], ""), |v| (v.color(), v.label()));
+                            let settled = p.settled.map_or(0.0, |st| st.back);
+                            ui.text_colored(
+                                color,
+                                format!(
+                                    "#{} {} | carte {:.0} regard {:.0} {} | ouv. recul {:.2} monte {:.2} | bilan {:.2} | {verdict}",
+                                    p.n,
+                                    p.item,
+                                    p.yaw,
+                                    p.pitch,
+                                    p.pose.label(),
+                                    p.open.back,
+                                    p.open.up,
+                                    settled
+                                ),
+                            );
+                        }
+                    });
+                    if let Some(saved) = to_slot.and_then(|i| s.push_log[i].start.clone()) {
+                        s.slots.push(saved);
+                    }
+                    if let Some(saved) = go.and_then(|i| s.push_log[i].start.clone()) {
+                        s.actions.push(Action::LoadAt(saved));
+                    }
                 }
 
                 if section(ui, "Positions (savestates)", true) {
@@ -255,7 +493,8 @@ impl ImguiRenderLoop for Overlay {
                         let _id = ui.push_id_usize(i);
                         let (p, n) = (s.slots[i].pos, s.slots[i].items.iter().map(|(_, c)| c).sum::<i32>());
                         let float = if s.slots[i].float != 0 { " + bouee" } else { "" };
-                        if ui.radio_button_bool(format!("#{}  {:.1} / {:.1} / {:.1}  ({n} items{float})", i + 1, p.x, p.y, p.z), s.selected == i) {
+                        let jelly = if s.slots[i].boost.0 { " + gelee" } else { "" };
+                        if ui.radio_button_bool(format!("#{}  {:.1} / {:.1} / {:.1}  ({n} items{float}{jelly})", i + 1, p.x, p.y, p.z), s.selected == i) {
                             s.selected = i;
                         }
                         ui.same_line();

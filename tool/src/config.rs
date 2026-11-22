@@ -2,7 +2,7 @@
 use std::path::Path;
 
 /// (action, default key). The index is the action id used by the overlay.
-pub const ACTIONS: [(&str, &str); 14] = [
+pub const ACTIONS: [(&str, &str); 16] = [
     ("menu", "F1"),
     ("noclip", "F2"),
     ("god", "F3"),
@@ -17,6 +17,8 @@ pub const ACTIONS: [(&str, &str); 14] = [
     ("anti_chute_off", ""),
     ("slot_precedent", ""),
     ("slot_suivant", ""),
+    ("fins_niveau", ""),
+    ("camera_libre", "F11"),
 ];
 
 pub type Keys = [Option<u16>; ACTIONS.len()];

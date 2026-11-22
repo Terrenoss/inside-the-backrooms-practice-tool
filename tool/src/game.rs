@@ -13,6 +13,7 @@ use hudhook::windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 use crate::call;
+use crate::push::{pitch_down_deg, start_position, wall_from_casts, Frame, Pose, PushRecord, Split, WALL_INSIDE};
 use crate::il2cpp::{self, alive, class, field, field_of, method, method_sig, rd, wr, M, P};
 
 #[repr(C)]
@@ -24,24 +25,28 @@ pub struct V3 {
 }
 
 impl V3 {
-    fn add_scaled(self, o: V3, k: f32) -> V3 {
+    pub(crate) fn add_scaled(self, o: V3, k: f32) -> V3 {
         V3 { x: self.x + o.x * k, y: self.y + o.y * k, z: self.z + o.z * k }
     }
 
-    fn sub(self, o: V3) -> V3 {
+    pub(crate) fn sub(self, o: V3) -> V3 {
         self.add_scaled(o, -1.0)
     }
 
-    fn scale(self, k: f32) -> V3 {
+    pub(crate) fn scale(self, k: f32) -> V3 {
         V3::default().add_scaled(self, k)
     }
 
-    fn dot(self, o: V3) -> f32 {
+    pub(crate) fn dot(self, o: V3) -> f32 {
         self.x * o.x + self.y * o.y + self.z * o.z
     }
 
-    fn cross(self, o: V3) -> V3 {
+    pub(crate) fn cross(self, o: V3) -> V3 {
         V3 { x: self.y * o.z - self.z * o.y, y: self.z * o.x - self.x * o.z, z: self.x * o.y - self.y * o.x }
+    }
+
+    pub(crate) fn len(self) -> f32 {
+        self.dot(self).sqrt()
     }
 
     pub fn dist(self, o: V3) -> f32 {
@@ -52,6 +57,41 @@ impl V3 {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Quat([f32; 4]);
+
+impl Quat {
+    /// Turn of `deg` degrees around the world's up axis (positive: from +Z toward +X, like Unity).
+    fn yaw(deg: f32) -> Quat {
+        let h = deg.to_radians() / 2.0;
+        Quat([0.0, h.sin(), 0.0, h.cos()])
+    }
+
+    /// `self` applied after `o`.
+    fn mul(self, o: Quat) -> Quat {
+        let ([ax, ay, az, aw], [bx, by, bz, bw]) = (self.0, o.0);
+        Quat([
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ])
+    }
+
+    /// `v` turned by this rotation (q * v * q^-1).
+    fn rotate(self, v: V3) -> V3 {
+        let [x, y, z, w] = self.0;
+        let t = V3 { x: 2.0 * (y * v.z - z * v.y), y: 2.0 * (z * v.x - x * v.z), z: 2.0 * (x * v.y - y * v.x) };
+        V3 { x: v.x + w * t.x + (y * t.z - z * t.y), y: v.y + w * t.y + (z * t.x - x * t.z), z: v.z + w * t.z + (x * t.y - y * t.x) }
+    }
+
+    /// Normalized lerp along the shortest way: plenty for two close aims.
+    fn nlerp(self, o: Quat, t: f32) -> Quat {
+        let dot: f32 = (0..4).map(|k| self.0[k] * o.0[k]).sum();
+        let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+        let q = [0, 1, 2, 3].map(|k| self.0[k] + (o.0[k] * sign - self.0[k]) * t);
+        let len = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+        Quat(q.map(|v| v / len))
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -92,6 +132,15 @@ impl Mat4 {
         let [x, y, _, w] = self.point(p);
         (w > 0.05).then(|| [x / w, y / w])
     }
+
+    fn translation(t: V3) -> Mat4 {
+        Mat4::from_basis(AXES[0], AXES[1], AXES[2], t)
+    }
+
+    /// Axes x, y, z (rotation and scale) as columns, then the translation t.
+    fn from_basis(x: V3, y: V3, z: V3, t: V3) -> Mat4 {
+        Mat4([x.x, x.y, x.z, 0.0, y.x, y.y, y.z, 0.0, z.x, z.y, z.z, 0.0, t.x, t.y, t.z, 1.0])
+    }
 }
 
 #[derive(Clone)]
@@ -102,6 +151,10 @@ pub struct Saved {
     pub items: Vec<(String, i32)>,
     /// Poolrooms float carried when saved (0 if none): handed back on load.
     pub float: usize,
+    /// PlayerController.lookDirection: y is the camera's vertical angle (x the horizontal one).
+    look: V3,
+    /// Moth jelly energy boost (on, seconds since eaten).
+    pub boost: (bool, f32),
 }
 
 /// Where the carried float would end up if dropped now, in world space.
@@ -111,16 +164,43 @@ pub struct DropInfo {
     radius: f32,
     land: Option<V3>,
     inside: bool,
+    /// Where it appears from the player's body (see side_of).
+    side: &'static str,
+    /// How far its top will stick out of the roof above (negative: stays under it), if there is one.
+    top: Option<f32>,
+    /// It would appear inside the player and push them out of it: the drop-and-jump boost.
+    on_player: bool,
 }
 
 impl DropInfo {
     pub fn label(&self) -> String {
-        match (self.inside, self.land.map(|l| self.pos.y - l.y)) {
+        let boost = if self.on_player { "dans toi (te pousse) | " } else { "" };
+        let verdict = match (self.inside, self.land.map(|l| self.pos.y - l.y)) {
             (true, _) => "dans le decor : sera ejectee".into(),
             (_, None) => "rien dessous : tombe dans le vide".into(),
             (_, Some(fall)) if fall > 1.0 => format!("retombe de {fall:.1} m"),
             (_, Some(fall)) => format!("reste en haut ({fall:.1} m)"),
+        };
+        let roof = match self.top {
+            Some(t) if t > 0.0 => format!(" | depasse du toit de {:.0} cm", t * 100.0),
+            Some(t) => format!(" | sous le toit, il manque {:.0} cm", -t * 100.0),
+            None => String::new(),
+        };
+        format!("{} : {boost}{verdict}{roof}", self.side)
+    }
+
+    /// For the float's own shape: green when it will stick out of the roof (grab it back from there).
+    pub fn roof_color(&self) -> [f32; 4] {
+        match self.top {
+            Some(t) if t > 0.0 => [0.2, 1.0, 0.3, 1.0],
+            Some(_) => [1.0, 0.2, 0.2, 1.0],
+            None => [1.0, 1.0, 1.0, 0.8],
         }
+    }
+
+    /// The green case: it stays at this height (on the roof).
+    fn stays_up(&self) -> bool {
+        !self.inside && self.land.is_some_and(|l| self.pos.y - l.y <= 1.0)
     }
 
     pub fn color(&self) -> [f32; 4] {
@@ -131,6 +211,303 @@ impl DropInfo {
             _ => [1.0, 0.2, 0.2, 1.0],
         }
     }
+}
+
+/// Looping test: savestates reloaded, the float dropped after each, until stopped. It learns which
+/// (spot, head turn) works: every spot and every turn giving the green preview gets tried, then the
+/// ones that work more often.
+/// Frames between the reload and the drop: the float settles in the hands meanwhile.
+const SETTLE_FRAMES: u32 = 30;
+/// Game seconds after the drop before judging: pushed through the roof and float grabbed by then.
+const WATCH_SECS: f32 = 3.0;
+/// Head turns tried at each spot: TURNS of them, SEEK_STEP degrees apart, centred on the slot's aim.
+pub const TURNS: usize = 41;
+const SEEK_STEP: f32 = 3.0;
+/// Frames per turn while sweeping them for the green preview (it follows the body a frame late).
+const SEEK_HOLD: u32 = 3;
+/// Before dropping, the preview must be green this many frames in a row, within HOLD_FRAMES.
+const GREEN_FRAMES: u32 = 3;
+const HOLD_FRAMES: u32 = 20;
+/// Rising at least this much (m) after the drop means the float pushed us through the roof.
+const ROOF_RISE: f32 = 1.0;
+
+/// Gap between two tested spots on the line between the two slots (m), and how many spots at most.
+const SPOT_STEP: f32 = 0.05;
+const MAX_SPOTS: usize = 41;
+
+pub struct Repeat {
+    /// The slot the test starts from and, to sweep the spots in between, the one at the other end.
+    pub from: usize,
+    pub to: Option<usize>,
+    phase: Phase,
+    /// The spot being tried and its head turn (None: its green turns aren't known yet, sweep first).
+    spot: usize,
+    turn: Option<usize>,
+    /// The spot's body rotation and lookDirection, before any head turn.
+    aim: (Quat, V3),
+    /// For each spot, which turns give the green preview (None until swept).
+    greens: Vec<Option<Vec<bool>>>,
+    scan: Vec<bool>,
+    /// Where the bot aimed when it grabbed the float back, and the preview's side at the drop.
+    grab: Option<V3>,
+    side: Option<Side>,
+}
+
+impl Repeat {
+    pub fn new(from: usize, to: Option<usize>) -> Self {
+        Repeat {
+            from,
+            to,
+            phase: Phase::Load,
+            spot: 0,
+            turn: None,
+            aim: Default::default(),
+            greens: Vec::new(),
+            scan: Vec::new(),
+            grab: None,
+            side: None,
+        }
+    }
+}
+
+/// How many spots get tried: one every SPOT_STEP from `a` to `b`, or just `a`.
+pub fn spot_count(a: &Saved, b: Option<&Saved>) -> usize {
+    b.map_or(1, |b| ((a.pos.dist(b.pos) / SPOT_STEP).round() as usize + 1).min(MAX_SPOTS))
+}
+
+/// Spot `i` of `n`: position and aim blended between the two slots, the rest from `a`.
+pub fn spot_at(a: &Saved, b: Option<&Saved>, i: usize, n: usize) -> Saved {
+    let Some(b) = b.filter(|_| n > 1) else { return a.clone() };
+    let t = i as f32 / (n - 1) as f32;
+    let lerp = |p: V3, q: V3| p.add_scaled(q.sub(p), t);
+    Saved { pos: lerp(a.pos, b.pos), rot: a.rot.nlerp(b.rot, t), look: lerp(a.look, b.look), ..a.clone() }
+}
+
+#[derive(Clone, Copy)]
+enum Phase {
+    Load,
+    Settle(u32),
+    /// Turning the head through every turn to see which ones give the green preview.
+    Scan { k: usize, frame: u32 },
+    /// Holding the chosen turn until the preview is steadily green, then dropping.
+    Hold { frame: u32, green: u32 },
+    Watch { t: f32, start_y: f32 },
+}
+
+/// Head turn (degrees) of turn index `k`: -60 for 0, 0 in the middle, +60 for the last.
+pub fn turn_deg(k: usize) -> f32 {
+    (k as f32 - (TURNS / 2) as f32) * SEEK_STEP
+}
+
+/// Direction a rotation faces, in degrees (0 = +Z, positive toward +X, i.e. turning right).
+fn yaw_of(q: Quat) -> f32 {
+    let [x, y, z, w] = q.0;
+    (2.0 * (x * z + w * y)).atan2(1.0 - 2.0 * (x * x + y * y)).to_degrees()
+}
+
+/// Where the drop preview sits around the player.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Side {
+    Front,
+    Right,
+    Back,
+    Left,
+}
+
+impl Side {
+    pub const ALL: [Side; 4] = [Side::Front, Side::Right, Side::Back, Side::Left];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Side::Front => "devant",
+            Side::Right => "a droite",
+            Side::Back => "derriere",
+            Side::Left => "a gauche",
+        }
+    }
+}
+
+/// Side of `drop` for a player at `player` facing `yaw` degrees (see yaw_of).
+fn drop_side(player: V3, yaw: f32, drop: V3) -> Side {
+    let d = drop.sub(player);
+    let a = (d.x.atan2(d.z).to_degrees() - yaw + 540.0).rem_euclid(360.0) - 180.0;
+    match a.abs() {
+        x if x <= 45.0 => Side::Front,
+        x if x >= 135.0 => Side::Back,
+        _ if a > 0.0 => Side::Right,
+        _ => Side::Left,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Outcome {
+    Success,
+    HornHidden,
+    NotThrough,
+    NeverGreen,
+}
+
+impl Outcome {
+    pub const ALL: [Outcome; 4] = [Outcome::Success, Outcome::HornHidden, Outcome::NotThrough, Outcome::NeverGreen];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Outcome::Success => "reussi : sur le toit avec la bouee",
+            Outcome::HornHidden => "sur le toit, bouee pas attrapable",
+            Outcome::NotThrough => "pas passe a travers le toit",
+            Outcome::NeverGreen => "pas de cercle vert (pas lachee)",
+        }
+    }
+
+    pub fn color(self) -> [f32; 4] {
+        match self {
+            Outcome::Success => [0.2, 1.0, 0.3, 1.0],
+            Outcome::HornHidden => [1.0, 0.6, 0.1, 1.0],
+            Outcome::NotThrough => [1.0, 0.2, 0.2, 1.0],
+            Outcome::NeverGreen => [0.6, 0.6, 0.6, 1.0],
+        }
+    }
+}
+
+pub struct Trial {
+    pub spot: usize,
+    /// Head turn index (None: no turn of this spot gave the green preview).
+    pub turn: Option<usize>,
+    pub outcome: Outcome,
+    /// Where the float ended up.
+    pub float_pos: V3,
+    /// Where the bot aimed to grab it back, when it did.
+    pub grab: Option<V3>,
+    /// Where the green preview was around the player at the drop.
+    pub side: Option<Side>,
+}
+
+/// `rise`: how much the player went up since the drop; `holding`: the float is back in the hands.
+fn classify(rise: f32, holding: bool) -> Outcome {
+    match (rise > ROOF_RISE, holding) {
+        (true, true) => Outcome::Success,
+        (true, false) => Outcome::HornHidden,
+        _ => Outcome::NotThrough,
+    }
+}
+
+/// Largest distance between two points: for final float positions, 0 means the game did exactly the same every time.
+pub fn spread(pts: &[V3]) -> f32 {
+    pts.iter().flat_map(|a| pts.iter().map(move |b| a.dist(*b))).fold(0.0, f32::max)
+}
+
+/// (tries, successes) of each spot, whatever the turn.
+pub fn spot_stats(trials: &[Trial], spots: usize) -> Vec<(usize, usize)> {
+    let mut out = vec![(0, 0); spots];
+    for t in trials.iter().filter(|t| t.spot < spots) {
+        out[t.spot].0 += 1;
+        out[t.spot].1 += (t.outcome == Outcome::Success) as usize;
+    }
+    out
+}
+
+/// (tries, successes) of each (spot, turn) cell: cell = spot * TURNS + turn.
+fn cell_stats(trials: &[Trial], spots: usize) -> Vec<(usize, usize)> {
+    let mut out = vec![(0, 0); spots * TURNS];
+    for t in trials.iter().filter(|t| t.spot < spots) {
+        if let Some(k) = t.turn {
+            let c = &mut out[t.spot * TURNS + k];
+            c.0 += 1;
+            c.1 += (t.outcome == Outcome::Success) as usize;
+        }
+    }
+    out
+}
+
+/// A cell with its neighbours one row and one column away (`cols` per row): for a line up, what
+/// you get standing 5 cm off or aiming 3 degrees off.
+fn zone_stats(stats: &[(usize, usize)], cols: usize, cell: usize) -> (usize, usize) {
+    let (row, col, rows) = (cell / cols, cell % cols, stats.len() / cols);
+    let mut out = (0, 0);
+    for r in row.saturating_sub(1)..(row + 2).min(rows) {
+        for c in col.saturating_sub(1)..(col + 2).min(cols) {
+            out.0 += stats[r * cols + c].0;
+            out.1 += stats[r * cols + c].1;
+        }
+    }
+    out
+}
+
+/// The tried cell that works most reliably even a bit off: best (successes + 1) / (tries + 2) over
+/// its zone, so 1/1 doesn't beat 9/10 and a lucky cell among failures doesn't beat a wide working area.
+fn best_cell(stats: &[(usize, usize)], cols: usize) -> Option<usize> {
+    let score = |c: usize| {
+        let (tries, ok) = zone_stats(stats, cols, c);
+        (ok as f32 + 1.0) / (tries as f32 + 2.0)
+    };
+    (0..stats.len()).filter(|&c| stats[c].0 > 0).max_by(|&i, &j| score(i).total_cmp(&score(j)))
+}
+
+/// Cells whose turn gave the green preview at their spot (only spot `only`'s if given).
+fn green_cells(greens: &[Option<Vec<bool>>], only: Option<usize>) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (i, g) in greens.iter().enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i)) {
+        out.extend(g.iter().flatten().enumerate().filter(|(_, &ok)| ok).map(|(k, _)| i * TURNS + k));
+    }
+    out
+}
+
+/// Cell to try next among `candidates`: untried ones first (closest to the slot's own aim), then
+/// UCB1: the success rate plus a bonus for few tries, so the test spends its time on what works
+/// while still rechecking the rest.
+fn next_cell(stats: &[(usize, usize)], candidates: &[usize]) -> Option<usize> {
+    let untried = candidates.iter().copied().filter(|&c| stats[c].0 == 0);
+    if let Some(c) = untried.min_by_key(|&c| (c % TURNS).abs_diff(TURNS / 2)) {
+        return Some(c);
+    }
+    let total = candidates.iter().map(|&c| stats[c].0).sum::<usize>() as f32;
+    let ucb = |c: usize| {
+        let (tries, ok) = stats[c];
+        ok as f32 / tries as f32 + (2.0 * total.ln() / tries as f32).sqrt()
+    };
+    candidates.iter().copied().max_by(|&i, &j| ucb(i).total_cmp(&ucb(j)))
+}
+
+/// The best line up the test found: where to stand, which way to face, where to aim for the horn.
+pub struct Lineup {
+    /// The spot with the head turned, ready to become a slot.
+    pub saved: Saved,
+    /// Direction to face (degrees, see yaw_of) and head turn from the first slot's aim.
+    pub yaw: f32,
+    pub turn: f32,
+    /// Distance from the first slot (m).
+    pub away: f32,
+    /// (tries, successes) of the line up itself, and with 5 cm / 3 degrees of error.
+    pub own: (usize, usize),
+    pub zone: (usize, usize),
+    pub grab: Option<V3>,
+    pub side: Option<Side>,
+    /// Where the float ended up each time.
+    pub ends: Vec<V3>,
+}
+
+pub fn lineup(s: &State) -> Option<Lineup> {
+    let (from, to) = s.run_slots;
+    let a = s.slots.get(from)?;
+    let b = to.and_then(|i| s.slots.get(i));
+    let spots = spot_count(a, b);
+    let stats = cell_stats(&s.trials, spots);
+    let best = best_cell(&stats, TURNS)?;
+    let (spot, k) = (best / TURNS, best % TURNS);
+    let mut saved = spot_at(a, b, spot, spots);
+    saved.rot = Quat::yaw(turn_deg(k)).mul(saved.rot);
+    let at_best = || s.trials.iter().filter(|t| t.spot == spot && t.turn == Some(k));
+    Some(Lineup {
+        yaw: yaw_of(saved.rot),
+        turn: turn_deg(k),
+        away: saved.pos.dist(a.pos),
+        own: stats[best],
+        zone: zone_stats(&stats, TURNS, best),
+        grab: at_best().filter_map(|t| t.grab).last(),
+        side: at_best().find_map(|t| t.side),
+        ends: at_best().map(|t| t.float_pos).collect(),
+        saved,
+    })
 }
 
 pub struct Point {
@@ -164,6 +541,8 @@ enum Kind {
     Invisible,
     Trigger,
     Special,
+    /// Ends the level (exit zone, end door, end interactable): drawn from any distance.
+    Exit,
     /// On a layer the player never touches: not drawn.
     Ignored,
 }
@@ -193,10 +572,14 @@ struct Col {
 pub enum Action {
     Save,
     Load(usize),
+    /// Load a savestate that isn't in the slot list (a spot of the looping test).
+    LoadAt(Saved),
     Give(String),
     Goto(V3),
     ToggleEntity(usize),
     ScanPoints,
+    /// Open every level for good, the way reaching them does (writes the game's Steam stats).
+    UnlockLevelsForever,
 }
 
 // Read by hooks too, so kept outside the mutex.
@@ -204,10 +587,13 @@ pub static GOD: AtomicBool = AtomicBool::new(false);
 pub static NOCLIP: AtomicBool = AtomicBool::new(false);
 pub static INF_ITEMS: AtomicBool = AtomicBool::new(false);
 pub static NO_FALL_TP: AtomicBool = AtomicBool::new(false);
+/// Every level counts as unlocked in the level select (v0.7.0 keeps unlocks in Steam stats).
+pub static UNLOCK_LEVELS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 pub struct State {
     pub menu_open: bool,
+    pub free_cam: bool,
     pub inf_stamina: bool,
     pub inf_oxygen: bool,
     pub no_anxiety: bool,
@@ -222,9 +608,54 @@ pub struct State {
     pub restore_inventory: bool,
     pub drop_preview: bool,
     pub drop: Option<DropInfo>,
+    pub show_float: bool,
+    pub show_trail: bool,
+    pub repeat: Option<Repeat>,
+    /// Skip head turns putting the green preview on your right (the float tends to fall there).
+    pub skip_right: bool,
+    /// 1-based slot to sweep to from the selected one, 0 for none.
+    pub sweep_to: i32,
+    /// (from, to) of the last test run, for its results.
+    pub run_slots: (usize, Option<usize>),
+    pub trials: Vec<Trial>,
+    pub repeat_error: Option<&'static str>,
+    /// The permanent level unlock waits for a second click; its result.
+    pub unlock_confirm: bool,
+    pub unlock_msg: Option<String>,
+    pub inspect_preview: bool,
+    /// Opacity of the inspected item's faces in the preview.
+    pub inspect_fill: f32,
+    /// Width of every overlay line, in pixels.
+    pub line_width: f32,
+    /// Name of the last inspected item, whose pooled copy the preview draws ("" before any).
+    pub inspect_item: String,
+    /// Whether inspected items (INSPECT_LAYER) are solid for the player.
+    pub inspect_solid: Option<bool>,
+    /// The inspection being measured, or the last one (see push.rs).
+    pub push: Option<PushRecord>,
+    /// Finished ones, the latest last, at most push_log_max.
+    pub push_log: Vec<PushRecord>,
+    pub push_log_max: usize,
+    /// Seconds after closing before taking the end result, how far back to look for the wall (m),
+    /// and for how many seconds after closing the last one stays drawn.
+    pub push_settle: f32,
+    pub push_wall_probe: f32,
+    pub push_shown: f32,
+    /// What the push drawing shows: capsule where it started, capsule now (or at the end), arrow
+    /// between them, the body's path, the wall's faces, the real copy while inspecting.
+    pub show_push_ghost: bool,
+    pub show_push_body: bool,
+    pub show_push_arrow: bool,
+    pub show_push_trail: bool,
+    pub show_push_wall: bool,
+    pub show_push_copy: bool,
+    push_n: usize,
+    /// Whether an inspection was open last frame.
+    push_was_open: bool,
     pub show_colliders: bool,
     pub show_visible_walls: bool,
     pub show_triggers: bool,
+    pub show_exits: bool,
     pub collider_radius: f32,
     pub actions: Vec<Action>,
     pub slots: Vec<Saved>,
@@ -232,6 +663,8 @@ pub struct State {
     // Filled by the game thread for the overlay.
     pub last_tick: Option<Instant>,
     pub pos: V3,
+    /// Direction the player faces (degrees, see yaw_of).
+    pub yaw: f32,
     pub stats: [f32; 4], // health, stamina, oxygen, anxiety
     pub game_time: f32,
     pub fall_time: f32,
@@ -244,12 +677,22 @@ pub struct State {
     pub labels: Vec<([f32; 2], String, [f32; 4])>,
     pub collider_count: usize,
     pub approx_count: usize,
+    pub exit_count: usize,
     // Game-thread bookkeeping.
     stats_obj: usize,
     max: [f32; 4],
     fly_pos: V3,
     applied_god: bool,
     applied_noclip: bool,
+    applied_free_cam: bool,
+    /// Free camera position, where the body is held meanwhile, and the camera's real position
+    /// while a frame renders from the free one.
+    cam_pos: V3,
+    cam_yaw: f32,
+    cam_pitch: f32,
+    /// Mouse look taken from the player (InputLookDir) for the free camera.
+    look_input: [f32; 2],
+    cam_saved: Option<(V3, Quat)>,
     applied_freeze: bool,
     applied_time_scale: f32,
     applied_mults: (f32, f32),
@@ -267,6 +710,28 @@ pub struct State {
     camera_hook_drew: bool,
     floats: Vec<usize>,
     last_float_scan: Option<Instant>,
+    /// The carried float's colliders in its own space (read while carried), how high it reaches
+    /// above its pivot, and which float that was.
+    float_shapes: Vec<(Mat4, Shape)>,
+    float_top: f32,
+    float_of_shapes: usize,
+    /// Where those shapes would be if dropped now.
+    drop_model: Option<Mat4>,
+    /// Float carried last frame, and the one lying dropped since when (drawn to grab it back),
+    /// where it appeared, and where it ended up.
+    carried_last: usize,
+    dropped: Option<(usize, Instant)>,
+    drop_spawn: Option<V3>,
+    pub landed: Option<Landed>,
+    /// Its path over the first seconds after the drop.
+    drop_trail: Vec<V3>,
+    /// Copied when an inspection opens: the game frees the item and its colliders on level change.
+    /// (collider space to pivot space, shape)
+    inspect_shapes: Vec<(Mat4, Shape)>,
+    /// Local player controller: a new one means a new level, whose unload freed the cached objects.
+    controller: usize,
+    /// Player capsule (center, radius, height) last frame.
+    capsule: Option<(V3, f32, f32)>,
 }
 
 pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
@@ -280,9 +745,32 @@ pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         restore_inventory: true,
         collider_radius: 25.0,
         drop_preview: true,
+        show_float: true,
+        show_trail: true,
+        skip_right: true,
+        inspect_preview: true,
+        inspect_fill: 0.3,
+        push_log_max: 30,
+        push_settle: 1.5,
+        push_wall_probe: 1.5,
+        push_shown: 15.0,
+        show_push_ghost: true,
+        show_push_body: true,
+        show_push_arrow: true,
+        show_push_trail: true,
+        show_push_wall: true,
+        line_width: 1.5,
         ..Default::default()
     })
 });
+
+impl State {
+    /// The push to show: being measured, or closed less than push_settle + push_shown seconds ago.
+    pub fn push_recent(&self) -> Option<&PushRecord> {
+        let shown = self.push_settle + self.push_shown;
+        self.push.as_ref().filter(|p| p.closed.is_none_or(|t| t.elapsed().as_secs_f32() < shown))
+    }
+}
 
 pub fn lock() -> MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
@@ -303,7 +791,58 @@ const SPECIAL_TRIGGERS: [(&str, &str, &str); 11] = [
     ("", "SubsceneTrigger", "CHARGEMENT ZONE"),
 ];
 
+// What can end a level (every caller of LevelEndings.Perform): (class, end id field, required item
+// field, label). BackroomsExitZone fires for any collider under the local player, not just its body.
+// EndPartyLevelDoor has no item field: its Interact checks the inventory for "FunDoorKey", written in
+// its code.
+const LEVEL_ENDS: [(&str, &str, &str, &str); 3] = [
+    ("BackroomsExitZone", "endGameID", "", "FIN DU NIVEAU"),
+    ("EndPartyLevelDoor", "endGameId", "", "FIN : porte [E] (il faut FunDoorKey)"),
+    ("EndInteractable", "endGameID", "requiredItem", "FIN : interaction [E]"),
+];
+
+/// One kind of LEVEL_ENDS found in this game version.
+struct LevelEnd {
+    ty: P,
+    off_id: usize,
+    off_item: Option<usize>,
+    label: &'static str,
+    /// Entered rather than used (BackroomsExitZone).
+    zone: bool,
+}
+
 const ELEVATORS: [&str; 4] = ["MainElevator", "Elevator", "HotelElevator", "LiftElevator"];
+
+// Inspect glitch: ItemInspectionUI.ShowInspectable puts the inspected item's copy this far in front of
+// the player camera, its pivot at world rotation identity; FinalizeInspectable gives it this layer and
+// AddInspectionCollider a solid collider (mesh, or its bounds as a box). The player gets pushed out
+// of it, sometimes through bars or curtains.
+const INSPECT_DISTANCE: f32 = 0.1;
+const INSPECT_LAYER: i32 = 30;
+const PUSH_SHOWN: Duration = Duration::from_secs(15);
+/// Seconds after an inspection opens during which the body's move counts as its push.
+const PUSH_OPEN_WINDOW: f32 = 0.15;
+/// How long a dropped float stays drawn (until picked up again).
+const DROPPED_SHOWN: Duration = Duration::from_secs(60);
+/// A dropped float's resting place is measured from LANDED_AFTER to LANDED_BY after the drop.
+const LANDED_AFTER: Duration = Duration::from_millis(500);
+const LANDED_BY: Duration = Duration::from_secs(3);
+
+/// LevelBoundaries (level start / end zones), None before 0.8.0.
+struct Boundaries {
+    ty: P,
+    level: M,
+    off_start: usize,
+    off_end: usize,
+}
+
+/// ItemInspectionUI, None if this game version renamed it.
+struct Inspection {
+    singleton: M,
+    is_inspecting: M,
+    off_current: usize,
+    off_pivot: usize,
+}
 
 struct G {
     player_controller: M,
@@ -313,14 +852,18 @@ struct G {
     player_vars: M,
     game_time: M,
     teleport: M,
+    /// Teleport takes holdForGround (0.8.0+), not before.
+    teleport_hold: bool,
     comp_transform: M,
     comp_gameobject: M,
     get_component: M,
+    get_components: M,
     obj_name: M,
     find_objects: M,
     tr_get_pos: M,
     tr_set_pos: M,
     tr_get_rot: M,
+    tr_set_rot: M,
     tr_forward: M,
     tr_right: M,
     tr_matrix: M,
@@ -355,39 +898,61 @@ struct G {
     col_raycast: M,
     tr_inverse: M,
     get_component_in_children: M,
+    go_transform: M,
+    tr_child_count: M,
+    tr_get_child: M,
+    cc_center: M,
+    cc_radius: M,
+    cc_height: M,
+    insp: Option<Inspection>,
     renderer_enabled: M,
     go_layer: M,
     ignore_layers: M,
-    ignore_pair: M,
+    /// Stripped from the v0.7.0 build: then no per-collider-pair exceptions are considered.
+    ignore_pair: Option<M>,
     item_names: M,
     add_item: M,
     remove_item: M,
     item_count: M,
     carry_drop_pos: M,
     carry_pickup: M,
+    carry_drop: M,
+    align_pitch: M,
+    player_interact: M,
     net_id: M,
     tr_scale: M,
     sphere_cast: M,
     check_sphere: M,
     off_carrier: usize,
     off_floater_radius: usize,
+    off_floater_colliders: usize,
     t_carry: P,
     t_identity: P,
     entities_singleton: M,
     gm_singleton: M,
     bm_singleton: M,
     bm_level_info: M,
-    boundaries_level: M,
+    boundaries: Option<Boundaries>,
     off_camera: usize,
     off_character: usize,
     off_gravity: usize,
     off_grounded: usize,
     off_falling_time: usize,
     off_falling_inf: usize,
+    off_look: usize,
+    off_boost: usize,
+    off_boost_timer: usize,
     off_stats: [usize; 4],
     off_invuln: usize,
     off_spawned: usize,
     off_vars: Vec<usize>, // speeds then jumpForce (last)
+    off_look_dir: usize,
+    /// PlayerController inputs the free camera's keys must not reach: (InputMoveDir,
+    /// InputRunningHold, m_WaitingToJumpRelease). None if a version renamed one.
+    off_move_inputs: Option<(usize, usize, usize)>,
+    /// BasePlayerController (IsCrawling, IsCrouched) backing fields, None if renamed.
+    off_pose: Option<(usize, usize)>,
+    off_look_speed: usize,
     off_fx: Vec<usize>,
     off_color_adj: usize,
     off_post_exposure: usize,
@@ -399,9 +964,6 @@ struct G {
     off_reset_point: usize,
     off_spawnpoints: usize,
     off_tp_points: usize,
-    off_lb_start: usize,
-    off_lb_end: usize,
-    off_exit_id: usize,
     off_swap_level: usize,
     off_tp_dest: usize,
     t_collider: P,
@@ -411,22 +973,35 @@ struct G {
     k_capsule: P,
     k_mesh: P,
     k_character: P,
-    t_boundaries: P,
-    t_exit: P,
     t_swap: P,
     t_tp: P,
     t_elevators: Vec<P>,
     specials: Vec<(P, &'static str)>,
+    level_ends: Vec<LevelEnd>,
     level_names: Vec<(i32, String)>,
     // Hook targets.
     pc_update: M,
     cam_update: M,
     begin_camera: M,
+    begin_context: M,
+    end_context: M,
     take_damage: M,
     kill_player: M,
     monster_kill: M,
     infinite_falling: M,
     wear_item: M,
+    level_unlocked: M,
+    /// v0.7.0: levels open from Steam stats (REACH_POOLROOMS...). Absent elsewhere.
+    level_unlock: Option<LevelUnlock>,
+}
+
+/// What reaching a level does in v0.7.0: its unlock stat set to 1, then the level opened.
+struct LevelUnlock {
+    get_info: M,
+    off_stat: usize,
+    instance: M,
+    set_stat: M,
+    mark: M,
 }
 
 // Only holds code/metadata pointers and type objects that il2cpp never frees.
@@ -444,9 +1019,12 @@ unsafe fn resolve() -> Result<G, String> {
         (k("Player")?, k("BasePlayerController")?, k("PlayerController")?, k("PlayerStats")?, k("NetworkInventory")?);
     let (items, ents, vars, cam, grounded) =
         (k("ItemList")?, k("EntitiesManager")?, k("PlayerVariablesInfo")?, k("PlayerCamera")?, k("GroundedChecker")?);
-    let (gm, bm, level_params, boundaries) =
-        (k("GameManager")?, k("BackroomsManager")?, k("BackroomLevelParameters")?, k("LevelBoundaries")?);
-    let (exit, swap, tp) = (k("BackroomsExitZone")?, k("BackroomsLevelSwapTrigger")?, k("ITBTeleportTrigger")?);
+    let (gm, bm, level_params) = (k("GameManager")?, k("BackroomsManager")?, k("BackroomLevelParameters")?);
+    let (swap, tp) = (k("BackroomsLevelSwapTrigger")?, k("ITBTeleportTrigger")?);
+    let (teleport, teleport_hold) = match method(bpc, "Teleport", 3) {
+        Ok(m) => (m, true),
+        Err(_) => (method(bpc, "Teleport", 2)?, false),
+    };
     let carry = class(ac, "ITB.SYSTEMS.POOLROOMS", "PoolroomsFloaterCarry")?;
     let identity = class("Mirror.dll", "Mirror", "NetworkIdentity")?;
     let ue = |name: &str| class(core, "UnityEngine", name);
@@ -473,15 +1051,21 @@ unsafe fn resolve() -> Result<G, String> {
         player_camera: method(player, "get_Camera", 0)?,
         player_vars: method(player, "get_vars", 0)?,
         game_time: method(player, "GetCurrentGameTime", 0)?,
-        teleport: method(bpc, "Teleport", 3)?,
+        teleport,
+        teleport_hold,
         comp_transform: method(comp, "get_transform", 0)?,
         comp_gameobject: method(comp, "get_gameObject", 0)?,
         get_component: method_sig(comp, "GetComponent", &["System.Type"])?,
+        get_components: method_sig(comp, "GetComponents", &["System.Type"])?,
         obj_name: method(object, "get_name", 0)?,
-        find_objects: method_sig(object, "FindObjectsByType", &["System.Type", "UnityEngine.FindObjectsSortMode"])?,
+        // v0.7.0 only has the older FindObjectsOfType(Type, includeInactive): called with 0 like the
+        // other (sort mode None), it is the same active-objects-only search.
+        find_objects: method_sig(object, "FindObjectsByType", &["System.Type", "UnityEngine.FindObjectsSortMode"])
+            .or_else(|_| method_sig(object, "FindObjectsOfType", &["System.Type", "System.Boolean"]))?,
         tr_get_pos: method(tr, "get_position", 0)?,
         tr_set_pos: method(tr, "set_position", 1)?,
         tr_get_rot: method(tr, "get_rotation", 0)?,
+        tr_set_rot: method(tr, "set_rotation", 1)?,
         tr_forward: method(tr, "get_forward", 0)?,
         tr_right: method(tr, "get_right", 0)?,
         tr_matrix: method(tr, "get_localToWorldMatrix", 0)?,
@@ -517,6 +1101,9 @@ unsafe fn resolve() -> Result<G, String> {
         tr_inverse: method(tr, "get_worldToLocalMatrix", 0)?,
         carry_drop_pos: method(carry, "GetSafeDropPosition", 1)?,
         carry_pickup: method(carry, "UserCode_CmdPickup__NetworkIdentity", 1)?,
+        carry_drop: method(carry, "UserCode_CmdDrop__NetworkIdentity", 1)?,
+        align_pitch: method(pc, "AlignCameraPitchToward", 2)?,
+        player_interact: method(player, "get_Interact", 0)?,
         net_id: method(identity, "get_netId", 0)?,
         tr_scale: method(tr, "get_localScale", 0)?,
         sphere_cast: method_sig(
@@ -534,13 +1121,28 @@ unsafe fn resolve() -> Result<G, String> {
         )?,
         off_carrier: f(carry, "m_CarrierNetId")?,
         off_floater_radius: f(carry, "floaterRadius")?,
+        off_floater_colliders: f(carry, "m_Colliders")?,
         t_carry: ty(carry),
         t_identity: ty(identity),
         get_component_in_children: method_sig(comp, "GetComponentInChildren", &["System.Type", "System.Boolean"])?,
+        go_transform: method(go, "get_transform", 0)?,
+        tr_child_count: method(tr, "get_childCount", 0)?,
+        tr_get_child: method(tr, "GetChild", 1)?,
+        cc_center: method(character, "get_center", 0)?,
+        cc_radius: method(character, "get_radius", 0)?,
+        cc_height: method(character, "get_height", 0)?,
+        insp: k("ItemInspectionUI").ok().and_then(|c| {
+            Some(Inspection {
+                singleton: method(c, "get_Singleton", 0).ok()?,
+                is_inspecting: method(c, "get_IsInspecting", 0).ok()?,
+                off_current: f(c, "m_CurrentInspectable").ok()?,
+                off_pivot: f(c, "inspectionPivot").ok()?,
+            })
+        }),
         renderer_enabled: method(renderer, "get_enabled", 0)?,
         go_layer: method(go, "get_layer", 0)?,
         ignore_layers: method(physics, "GetIgnoreLayerCollision", 2)?,
-        ignore_pair: method(physics, "GetIgnoreCollision", 2)?,
+        ignore_pair: method(physics, "GetIgnoreCollision", 2).ok(),
         item_names: method(items, "GetItemsNames", 0)?,
         add_item: method(inv, "ServerAddItem", 1)?,
         remove_item: method(inv, "ServerRemoveItem", 2)?,
@@ -549,16 +1151,34 @@ unsafe fn resolve() -> Result<G, String> {
         gm_singleton: method(gm, "get_singleton", 0)?,
         bm_singleton: method(bm, "get_Singleton", 0)?,
         bm_level_info: method(bm, "get_CurrentLevelInfo", 0)?,
-        boundaries_level: method(boundaries, "get_Level", 0)?,
+        boundaries: k("LevelBoundaries").ok().and_then(|c| {
+            Some(Boundaries {
+                ty: ty(c),
+                level: method(c, "get_Level", 0).ok()?,
+                off_start: f(c, "startZone").ok()?,
+                off_end: f(c, "endZones").ok()?,
+            })
+        }),
         off_camera: f(bpc, "playerCamera")?,
         off_character: f(pc, "Controller")?,
         off_gravity: f(pc, "m_GravityForce")?,
         off_grounded: f(bpc, "groundedChecker")?,
         off_falling_time: f(grounded, "<FallingTime>k__BackingField")?,
         off_falling_inf: f(grounded, "<FallingToInfinte>k__BackingField")?,
+        off_look: f(pc, "lookDirection")?,
+        off_boost: f(stats, "m_HasEnergyBoost")?,
+        off_boost_timer: f(stats, "m_EnergyBoostTimer")?,
         off_stats: [f(stats, "health")?, f(stats, "m_Stamina")?, f(stats, "m_Oxygen")?, f(stats, "anxiety")?],
         off_invuln: f(stats, "m_HasInvulnerability")?,
         off_spawned: f(ents, "SpawnedEntities")?,
+        off_look_dir: f(pc, "InputLookDir")?,
+        off_pose: f(bpc, "<IsCrawling>k__BackingField")
+            .and_then(|c| Ok((c, f(bpc, "<IsCrouched>k__BackingField")?)))
+            .ok(),
+        off_move_inputs: f(pc, "InputMoveDir")
+            .and_then(|m| Ok((m, f(pc, "InputRunningHold")?, f(pc, "m_WaitingToJumpRelease")?)))
+            .ok(),
+        off_look_speed: f(vars, "lookSpeed")?,
         off_vars: [
             "walkSpeed", "crawlWalkSpeed", "runSpeed", "jogSpeed", "crouchWalkSpeed", "climbSpeed", "ropeClimbSpeed",
             "swimSpeed", "swimSpeedFast", "diveSpeed", "diveSpeedFast", "jumpForce",
@@ -583,9 +1203,6 @@ unsafe fn resolve() -> Result<G, String> {
         off_reset_point: f(level_params, "resetPlayerPoint")?,
         off_spawnpoints: f(level_params, "playerSpawnpoints")?,
         off_tp_points: f(level_params, "teleportPoints")?,
-        off_lb_start: f(boundaries, "startZone")?,
-        off_lb_end: f(boundaries, "endZones")?,
-        off_exit_id: f(exit, "endGameID")?,
         off_swap_level: f(swap, "newLevel")?,
         off_tp_dest: f(tp, "teleportPoint")?,
         t_collider: ty(collider),
@@ -595,21 +1212,48 @@ unsafe fn resolve() -> Result<G, String> {
         k_capsule: capsule,
         k_mesh: meshc,
         k_character: character,
-        t_boundaries: ty(boundaries),
-        t_exit: ty(exit),
         t_swap: ty(swap),
         t_tp: ty(tp),
         t_elevators: ELEVATORS.iter().filter_map(|n| k(n).ok()).map(|c| ty(c)).collect(),
         specials: SPECIAL_TRIGGERS.iter().filter_map(|(ns, n, l)| class(ac, ns, n).ok().map(|c| (ty(c), *l))).collect(),
+        level_ends: LEVEL_ENDS
+            .iter()
+            .filter_map(|&(n, id, item, label)| {
+                let c = k(n).ok()?;
+                let off_item = if item.is_empty() { None } else { Some(f(c, item).ok()?) };
+                Some(LevelEnd { ty: ty(c), off_id: f(c, id).ok()?, off_item, label, zone: n == "BackroomsExitZone" })
+            })
+            .collect(),
         level_names: il2cpp::enum_values(k("BackroomsLevel")?),
         pc_update: method(pc, "Update", 0)?,
         cam_update: method(cam, "Update", 0)?,
         begin_camera: method(render_pipeline, "BeginCameraRendering", 2)?,
+        begin_context: method(render_pipeline, "BeginContextRendering", 2)?,
+        end_context: method(render_pipeline, "EndContextRendering", 2)?,
         take_damage: method(stats, "ServerTakeDamage", 1)?,
         kill_player: method(stats, "CmdKillPlayer", 1)?,
-        monster_kill: method(bpc, "PerformMonsterKill", 4)?,
+        // Not BasePlayerController's: empty, so its code is a stub shared by ~1300 other methods.
+        monster_kill: method(pc, "PerformMonsterKill", 4)?,
         infinite_falling: method(bpc, "CheckForInfinteFalling", 0)?,
         wear_item: method(inv, "ServerWearItem", 2)?,
+        level_unlocked: method(k("BackroomsLevelsAccess")?, "IsLevelUnlocked", 1)?,
+        level_unlock: (|| -> Result<LevelUnlock, String> {
+            let (dict, info, mgr) = (class(ac, "ITB.Core", "ITBDictionary")?, class(ac, "ITB.Scenario", "BasicLevelInfo")?, k("AchievmentManager")?);
+            let u = LevelUnlock {
+                get_info: method_sig(dict, "GetLevelInfo", &["BackroomsLevel"])?,
+                off_stat: f(info, "m_LevelUnlockStat")?,
+                instance: method(mgr, "get_Instance", 0)?,
+                set_stat: method_sig(mgr, "SetNewStatValue", &["AchievmentManager.SteamStat", "System.Int32"])?,
+                mark: method(mgr, "MarkUnlockedLevelByStat", 1)?,
+            };
+            // The calls below depend on it: a static SetNewStatValue, an instance MarkUnlockedLevelByStat.
+            let shapes = [(u.get_info, true), (u.instance, true), (u.set_stat, true), (u.mark, false)];
+            if shapes.iter().any(|&(m, want_static)| il2cpp::is_static(m) != want_static) {
+                return Err("forme inattendue des fonctions de deblocage".into());
+            }
+            Ok(u)
+        })()
+        .ok(),
     })
 }
 
@@ -621,11 +1265,14 @@ fn g() -> &'static G {
 static O_UPDATE: AtomicUsize = AtomicUsize::new(0);
 static O_CAM_UPDATE: AtomicUsize = AtomicUsize::new(0);
 static O_BEGIN_CAMERA: AtomicUsize = AtomicUsize::new(0);
+static O_BEGIN_CONTEXT: AtomicUsize = AtomicUsize::new(0);
+static O_END_CONTEXT: AtomicUsize = AtomicUsize::new(0);
 static O_DAMAGE: AtomicUsize = AtomicUsize::new(0);
 static O_KILL: AtomicUsize = AtomicUsize::new(0);
 static O_MONSTER_KILL: AtomicUsize = AtomicUsize::new(0);
 static O_FALLING: AtomicUsize = AtomicUsize::new(0);
 static O_WEAR: AtomicUsize = AtomicUsize::new(0);
+static O_UNLOCKED: AtomicUsize = AtomicUsize::new(0);
 
 /// Called once from the init thread, after hudhook initialized MinHook.
 pub unsafe fn install() -> Result<(), String> {
@@ -635,22 +1282,33 @@ pub unsafe fn install() -> Result<(), String> {
     _ = G.set(r.map_err(|e| format!("introuvable dans le jeu : {e}"))?);
     let g = g();
     crate::log(&format!(
-        "{} niveaux, {}/{} types de triggers, {}/{} ascenseurs",
+        "{} niveaux, {}/{} types de triggers, {}/{} types de fins, {}/{} ascenseurs, inspection {}",
         g.level_names.len(),
         g.specials.len(),
         SPECIAL_TRIGGERS.len(),
+        g.level_ends.len(),
+        LEVEL_ENDS.len(),
         g.t_elevators.len(),
-        ELEVATORS.len()
+        ELEVATORS.len(),
+        if g.insp.is_some() { "ok" } else { "introuvable" }
     ));
-    let hooks: [(M, usize, &AtomicUsize); 8] = [
+    crate::log(if g.level_unlock.is_some() {
+        "deblocage definitif des niveaux : disponible"
+    } else {
+        "deblocage definitif des niveaux : indisponible dans cette version"
+    });
+    let hooks: [(M, usize, &AtomicUsize); 11] = [
         (g.pc_update, pc_update as usize, &O_UPDATE),
         (g.cam_update, cam_update as usize, &O_CAM_UPDATE),
         (g.begin_camera, begin_camera as usize, &O_BEGIN_CAMERA),
+        (g.begin_context, begin_context as usize, &O_BEGIN_CONTEXT),
+        (g.end_context, end_context as usize, &O_END_CONTEXT),
         (g.take_damage, take_damage as usize, &O_DAMAGE),
         (g.kill_player, kill_player as usize, &O_KILL),
         (g.monster_kill, monster_kill as usize, &O_MONSTER_KILL),
         (g.infinite_falling, infinite_falling as usize, &O_FALLING),
         (g.wear_item, wear_item as usize, &O_WEAR),
+        (g.level_unlocked, level_unlocked as usize, &O_UNLOCKED),
     ];
     for (target, detour, orig) in hooks {
         let h = MhHook::new(target.0 as _, detour as _).map_err(|e| format!("hook: {e:?}"))?;
@@ -658,6 +1316,47 @@ pub unsafe fn install() -> Result<(), String> {
         h.queue_enable().map_err(|e| format!("hook: {e:?}"))?;
     }
     MH_ApplyQueued().ok().map_err(|e| format!("hook: {e:?}"))
+}
+
+/// `hold`: wait for the ground to stream in before letting the player fall (0.8.0+ only).
+unsafe fn teleport(g: &G, ctrl: P, pos: V3, rot: Quat, hold: bool) {
+    if g.teleport_hold {
+        call!(g.teleport, fn(P, V3, Quat, bool), ctrl, pos, rot, hold)
+    } else {
+        call!(g.teleport, fn(P, V3, Quat), ctrl, pos, rot)
+    }
+}
+
+/// Unity's Quaternion.Euler(pitch, yaw, 0), in degrees: yaw around Y, then pitch (down > 0).
+fn yaw_pitch_rotation(yaw: f32, pitch: f32) -> Quat {
+    let (sy, cy) = (yaw.to_radians() / 2.0).sin_cos();
+    let (sp, cp) = (pitch.to_radians() / 2.0).sin_cos();
+    Quat([cy * sp, sy * cp, -sy * sp, cy * cp])
+}
+
+/// Forward and right of that rotation.
+fn yaw_pitch_axes(yaw: f32, pitch: f32) -> (V3, V3) {
+    let (sy, cy) = yaw.to_radians().sin_cos();
+    let (sp, cp) = pitch.to_radians().sin_cos();
+    (V3 { x: sy * cp, y: -sp, z: cy * cp }, V3 { x: cy, y: 0.0, z: -sy })
+}
+
+/// Yaw and pitch (degrees) looking along `f`.
+fn yaw_pitch_of(f: V3) -> (f32, f32) {
+    (f.x.atan2(f.z).to_degrees(), (-f.y).clamp(-1.0, 1.0).asin().to_degrees())
+}
+
+/// This frame's ZQSD / Space / Ctrl move along a view (Shift x3), for noclip and the free camera.
+unsafe fn fly_step(g: &G, s: &State, fwd: V3, right: V3) -> V3 {
+    if s.menu_open || !crate::game_focused() {
+        return V3::default();
+    }
+    let axis = |p: bool, n: bool| p as i32 as f32 - n as i32 as f32;
+    let speed = s.fly_speed * if key(VK_LSHIFT.0) { 3.0 } else { 1.0 } * call!(g.delta_time, fn() -> f32);
+    V3::default()
+        .add_scaled(fwd, axis(key_at(SC_W), key_at(SC_S)) * speed)
+        .add_scaled(right, axis(key_at(SC_D), key_at(SC_A)) * speed)
+        .add_scaled(V3 { x: 0.0, y: 1.0, z: 0.0 }, axis(key(VK_SPACE.0), key(VK_LCONTROL.0)) * speed)
 }
 
 unsafe fn local_controller() -> P {
@@ -670,8 +1369,26 @@ unsafe fn local_stats() -> P {
 
 unsafe extern "C-unwind" fn pc_update(this: P, mi: usize) {
     let orig: unsafe extern "C-unwind" fn(P, usize) = std::mem::transmute(O_UPDATE.load(Relaxed));
+    let ours = !this.is_null() && this == local_controller();
+    if ours {
+        // Free camera: the mouse turns it, not the player. OnLookInput (input callback, before
+        // Update) stores the look delta that UpdateLookRotation applies during this Update.
+        let mut s = lock();
+        if s.free_cam {
+            let d: [f32; 2] = rd(this, g().off_look_dir);
+            s.look_input = [s.look_input[0] + d[0], s.look_input[1] + d[1]];
+            wr(this, g().off_look_dir, [0.0f32; 2]);
+            // ZQSD / Shift / Space fly the free camera: the body doesn't walk, run or jump with them,
+            // but the game still moves it otherwise (the inspect push, gravity, crawling).
+            if let Some((mv, run, jump_wait)) = g().off_move_inputs {
+                wr(this, mv, [0.0f32; 2]);
+                wr(this, run, false);
+                wr(this, jump_wait, true); // JumpCheck waits for Space to be released first
+            }
+        }
+    }
     orig(this, mi);
-    if !this.is_null() && this == local_controller() {
+    if ours {
         tick(g(), this);
     }
 }
@@ -695,6 +1412,46 @@ unsafe extern "C-unwind" fn begin_camera(context: usize, cam: P, mi: usize) {
     if !cam.is_null() && cam as usize == s.camera && alive(cam) {
         draw(g(), s, cam);
         s.camera_hook_drew = true;
+    }
+}
+
+/// The player's camera among the ones HDRP is about to render (live objects, unlike s.camera).
+unsafe fn rendered_player_camera(s: &State, cameras: P) -> Option<P> {
+    il2cpp::list(cameras).into_iter().find(|&c| c as usize == s.camera && alive(c))
+}
+
+// Free camera: the player's camera is moved for the frame's render only (end_context puts it back),
+// so the game, and the float held at the view (PlayerGear.floaterAnchorPoint), keep the real one.
+// HDRP works out each camera's view (PrepareAndCullCamera) after BeginContextRendering but before
+// BeginCameraRendering: this is the last point where moving it still changes the image.
+unsafe extern "C-unwind" fn begin_context(context: usize, cameras: P, mi: usize) {
+    {
+        let mut guard = lock();
+        let s = &mut *guard;
+        if let Some(cam) = rendered_player_camera(s, cameras).filter(|_| s.applied_free_cam) {
+            let tr = call!(g().comp_transform, fn(P) -> P, cam);
+            if s.cam_saved.is_none() {
+                s.cam_saved = Some((call!(g().tr_get_pos, fn(P) -> V3, tr), call!(g().tr_get_rot, fn(P) -> Quat, tr)));
+            }
+            call!(g().tr_set_pos, fn(P, V3), tr, s.cam_pos);
+            call!(g().tr_set_rot, fn(P, Quat), tr, yaw_pitch_rotation(s.cam_yaw, s.cam_pitch));
+        }
+    }
+    let orig: unsafe extern "C-unwind" fn(usize, P, usize) = std::mem::transmute(O_BEGIN_CONTEXT.load(Relaxed));
+    orig(context, cameras, mi);
+}
+
+unsafe extern "C-unwind" fn end_context(context: usize, cameras: P, mi: usize) {
+    let orig: unsafe extern "C-unwind" fn(usize, P, usize) = std::mem::transmute(O_END_CONTEXT.load(Relaxed));
+    orig(context, cameras, mi);
+    let mut guard = lock();
+    let s = &mut *guard;
+    if let Some(cam) = rendered_player_camera(s, cameras) {
+        if let Some((p, r)) = s.cam_saved.take() {
+            let tr = call!(g().comp_transform, fn(P) -> P, cam);
+            call!(g().tr_set_pos, fn(P, V3), tr, p);
+            call!(g().tr_set_rot, fn(P, Quat), tr, r);
+        }
     }
 }
 
@@ -739,6 +1496,15 @@ unsafe extern "C-unwind" fn wear_item(this: P, item: P, amount: f32, mi: usize) 
     }
     let orig: unsafe extern "C-unwind" fn(P, P, f32, usize) = std::mem::transmute(O_WEAR.load(Relaxed));
     orig(this, item, amount, mi)
+}
+
+// Static BackroomsLevelsAccess.IsLevelUnlocked(BackroomsLevel): only answers, saves nothing.
+unsafe extern "C-unwind" fn level_unlocked(level: i32, mi: usize) -> bool {
+    if UNLOCK_LEVELS.load(Relaxed) {
+        return true;
+    }
+    let orig: unsafe extern "C-unwind" fn(i32, usize) -> bool = std::mem::transmute(O_UNLOCKED.load(Relaxed));
+    orig(level, mi)
 }
 
 fn key(vk: u16) -> bool {
@@ -802,19 +1568,23 @@ unsafe fn scan_points(g: &G) -> Vec<Point> {
             add(format!("Point de TP #{}", i + 1), transform_pos(g, t));
         }
     }
-    for b in find(g, g.t_boundaries) {
-        let level = level_name(g, call!(g.boundaries_level, fn(P) -> i32, b));
-        let start: P = rd(b, g.off_lb_start);
-        if !start.is_null() {
-            add(format!("Debut {level}"), field_of(start, "center").ok().and_then(|o| transform_pos(g, rd(start, o))));
-        }
-        for z in il2cpp::array(rd(b, g.off_lb_end)).into_iter().filter(|z| !z.is_null()) {
-            let unlock = field_of(z, "unlockLevel").map_or(String::new(), |o| level_name(g, rd(z, o)));
-            add(format!("Fin {level} -> {unlock}"), field_of(z, "center").ok().and_then(|o| transform_pos(g, rd(z, o))));
+    if let Some(lb) = &g.boundaries {
+        for b in find(g, lb.ty) {
+            let level = level_name(g, call!(lb.level, fn(P) -> i32, b));
+            let start: P = rd(b, lb.off_start);
+            if !start.is_null() {
+                add(format!("Debut {level}"), field_of(start, "center").ok().and_then(|o| transform_pos(g, rd(start, o))));
+            }
+            for z in il2cpp::array(rd(b, lb.off_end)).into_iter().filter(|z| !z.is_null()) {
+                let unlock = field_of(z, "unlockLevel").map_or(String::new(), |o| level_name(g, rd(z, o)));
+                add(format!("Fin {level} -> {unlock}"), field_of(z, "center").ok().and_then(|o| transform_pos(g, rd(z, o))));
+            }
         }
     }
-    for c in find(g, g.t_exit) {
-        add(format!("Sortie (fin #{})", rd::<i32>(c, g.off_exit_id)), transform_pos(g, c));
+    for end in &g.level_ends {
+        for c in find(g, end.ty) {
+            add(end_label(end, c), transform_pos(g, c));
+        }
     }
     for c in find(g, g.t_swap) {
         add(format!("Passage -> {}", level_name(g, rd(c, g.off_swap_level))), transform_pos(g, c));
@@ -835,6 +1605,37 @@ unsafe fn scan_points(g: &G) -> Vec<Point> {
     v
 }
 
+unsafe fn end_label(end: &LevelEnd, comp: P) -> String {
+    let mut label = format!("{} #{}", end.label, rd::<i32>(comp, end.off_id));
+    let item = end.off_item.map_or(String::new(), |off| il2cpp::string(rd(comp, off)));
+    if !item.is_empty() {
+        label += &format!(" (il faut {item})");
+    }
+    label
+}
+
+/// Everything that currently ends the level: (collider, or the component itself when its object
+/// has none, is it a collider, label).
+unsafe fn level_ends(g: &G) -> Vec<(P, bool, String)> {
+    let mut out = Vec::new();
+    for end in &g.level_ends {
+        for c in find(g, end.ty) {
+            let label = end_label(end, c);
+            let cols = il2cpp::array(call!(g.get_components, fn(P, P) -> P, c, g.t_collider));
+            if cols.is_empty() {
+                out.push((c, false, label));
+                continue;
+            }
+            for col in cols {
+                // A solid one only works through OnCollisionEnter (useCollision).
+                let solid = end.zone && !call!(g.col_trigger, fn(P) -> bool, col);
+                out.push((col, true, if solid { format!("{label} - au contact") } else { label.clone() }));
+            }
+        }
+    }
+    out
+}
+
 // The game's own names for its invisible walls (BoundsCollider, InvisibleWall, LiftBoundsCollider,
 // LimitExitCollider...). A missing renderer proves nothing here: most of the world is drawn through
 // Entities, and its collision sits on bare objects (PROPS_COLLIDERS_CACHE/*_cacheCollider).
@@ -850,7 +1651,8 @@ unsafe fn describe(g: &G, col: P, k: P, player: Option<(P, i32)>, budget: &mut u
     let layer = call!(g.go_layer, fn(P) -> i32, go);
     // shortcut: ignores Collider.excludeLayers (stripped from this build) and layer changes after the scan.
     let touches = player.is_none_or(|(cc, own)| {
-        !call!(g.ignore_layers, fn(i32, i32) -> bool, own, layer) && !call!(g.ignore_pair, fn(P, P) -> bool, cc, col)
+        !call!(g.ignore_layers, fn(i32, i32) -> bool, own, layer)
+            && !g.ignore_pair.is_some_and(|m| call!(m, fn(P, P) -> bool, cc, col))
     });
     let name = name_of(g, go);
     let mut label = String::new();
@@ -882,12 +1684,7 @@ unsafe fn shape(g: &G, col: P, k: P, budget: &mut u32) -> Option<Shape> {
     Some(if k == g.k_box {
         box_shape(v3(g.box_center), v3(g.box_size).scale(0.5))
     } else if k == g.k_sphere {
-        let (c, r) = (v3(g.sphere_center), f(g.sphere_radius));
-        let mut edges = Vec::new();
-        for i in 0..3 {
-            arc(&mut edges, c, AXES[i], AXES[(i + 1) % 3], r, 0.0, TAU);
-        }
-        Shape { edges, ..Default::default() }
+        sphere_shape(v3(g.sphere_center), f(g.sphere_radius))
     } else if k == g.k_capsule {
         let dir = call!(g.capsule_direction, fn(P) -> i32, col);
         capsule_shape(v3(g.capsule_center), f(g.capsule_radius), f(g.capsule_height), dir)
@@ -922,6 +1719,7 @@ unsafe fn mesh_shape(g: &G, col: P, budget: &mut u32) -> Option<Shape> {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Ray {
     origin: V3,
     dir: V3,
@@ -1045,6 +1843,15 @@ fn arc(edges: &mut Vec<(V3, V3)>, c: V3, u: V3, v: V3, r: f32, a0: f32, a1: f32)
     edges.extend((0..n).map(|i| (p(i), p(i + 1))));
 }
 
+/// Sphere as three great circles.
+fn sphere_shape(c: V3, r: f32) -> Shape {
+    let mut edges = Vec::new();
+    for i in 0..3 {
+        arc(&mut edges, c, AXES[i], AXES[(i + 1) % 3], r, 0.0, TAU);
+    }
+    Shape { edges, ..Default::default() }
+}
+
 /// Capsule along local axis `dir` (0 = X, 1 = Y, 2 = Z): end rings, side lines and the two caps.
 fn capsule_shape(c: V3, r: f32, height: f32, dir: i32) -> Shape {
     let d = dir.clamp(0, 2) as usize;
@@ -1109,6 +1916,15 @@ fn aabb_dist(b: &Bounds, p: V3) -> f32 {
     (x * x + y * y + z * z).sqrt()
 }
 
+/// Size of the marker drawn for a level end with no collider of its own.
+const MARKER_RADIUS: f32 = 0.5;
+
+fn cache(infos: &mut BTreeMap<(usize, usize), Arc<Info>>, key: (usize, usize), info: Info) -> Arc<Info> {
+    let info = Arc::new(info);
+    infos.insert(key, info.clone());
+    info
+}
+
 unsafe fn scan_colliders(g: &G, s: &mut State, ctrl: P, pos: V3) {
     let cc = rd::<P>(ctrl, g.off_character);
     let player = alive(cc).then(|| (cc, call!(g.go_layer, fn(P) -> i32, call!(g.comp_gameobject, fn(P) -> P, cc))));
@@ -1117,9 +1933,41 @@ unsafe fn scan_colliders(g: &G, s: &mut State, ctrl: P, pos: V3) {
     let mut budget = 6;
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for c in find(g, g.t_collider) {
+    // Level ends first and at any distance: the nearby scan below leaves their colliders alone.
+    let ends = if s.show_exits { level_ends(g) } else { Vec::new() };
+    for (obj, collider, label) in &ends {
+        let (obj, collider) = (*obj, *collider);
+        if collider && !call!(g.col_enabled, fn(P) -> bool, obj) {
+            continue;
+        }
+        let key = (obj as usize, rd::<usize>(obj, 0x10));
+        seen.insert(key);
+        let bounds = if collider {
+            call!(g.col_bounds, fn(P) -> Bounds, obj)
+        } else {
+            let Some(center) = transform_pos(g, obj) else { continue };
+            Bounds { center, extents: V3 { x: MARKER_RADIUS, y: MARKER_RADIUS, z: MARKER_RADIUS } }
+        };
+        let info = match s.infos.get(&key).filter(|i| i.kind == Kind::Exit) {
+            Some(info) => info.clone(),
+            None => {
+                let drawn = if collider {
+                    shape(g, obj, (il2cpp::api().object_get_class)(obj), &mut budget)
+                } else {
+                    Some(sphere_shape(V3::default(), MARKER_RADIUS))
+                };
+                let Some(drawn) = drawn else { continue }; // sampling budget spent: next scan
+                cache(&mut s.infos, key, Info { kind: Kind::Exit, label: label.clone(), shape: drawn })
+            },
+        };
+        if !info.shape.edges.is_empty() {
+            out.push(Col { obj: obj as usize, info, bounds });
+        }
+    }
+    s.exit_count = out.len();
+    for c in if s.show_colliders || s.show_triggers { find(g, g.t_collider) } else { Vec::new() } {
         let k = (il2cpp::api().object_get_class)(c);
-        if k == g.k_character || !call!(g.col_enabled, fn(P) -> bool, c) {
+        if k == g.k_character || !call!(g.col_enabled, fn(P) -> bool, c) || ends.iter().any(|e| e.0 == c) {
             continue;
         }
         let key = (c as usize, rd::<usize>(c, 0x10));
@@ -1128,10 +1976,10 @@ unsafe fn scan_colliders(g: &G, s: &mut State, ctrl: P, pos: V3) {
         if aabb_dist(&bounds, pos) > radius {
             continue;
         }
-        let info = match s.infos.get(&key) {
+        let info = match s.infos.get(&key).filter(|i| i.kind != Kind::Exit) {
             Some(info) => info.clone(),
             None => match describe(g, c, k, player, &mut budget) {
-                Some(info) => s.infos.entry(key).or_insert(Arc::new(info)).clone(),
+                Some(info) => cache(&mut s.infos, key, info),
                 None => continue, // sampling budget spent: next scan
             },
         };
@@ -1140,7 +1988,7 @@ unsafe fn scan_colliders(g: &G, s: &mut State, ctrl: P, pos: V3) {
         }
     }
     s.infos.retain(|k, _| seen.contains(k));
-    s.collider_count = out.len();
+    s.collider_count = out.len() - s.exit_count;
     s.approx_count = out.iter().filter(|c| c.info.shape.approx).count();
     s.colliders = out;
 }
@@ -1171,8 +2019,17 @@ unsafe fn draw(g: &G, s: &mut State, cam: P) {
     s.lines.clear();
     s.polys.clear();
     s.labels.clear();
-    let hitboxes = s.show_colliders || s.show_triggers;
-    if !hitboxes && s.drop.is_none() {
+    let hitboxes = s.show_colliders || s.show_triggers || s.show_exits;
+    let inspect = s.inspect_preview && !s.inspect_shapes.is_empty() || s.push_recent().is_some();
+    // From the free camera, the player's own body usually isn't drawn: show where it is.
+    let body = s.capsule.filter(|_| s.applied_free_cam);
+    // s.floats is rescanned every second and emptied on level change: a float still in it is safe.
+    let dropped = s
+        .dropped
+        .filter(|(f, t)| s.show_float && t.elapsed() < DROPPED_SHOWN && s.floats.contains(f))
+        .map(|(f, _)| f as P)
+        .filter(|&f| alive(f));
+    if !hitboxes && s.drop.is_none() && !inspect && body.is_none() && dropped.is_none() && s.trials.is_empty() {
         return;
     }
     let eye = call!(g.tr_get_pos, fn(P) -> V3, call!(g.comp_transform, fn(P) -> P, cam));
@@ -1183,61 +2040,592 @@ unsafe fn draw(g: &G, s: &mut State, cam: P) {
     if let Some(d) = s.drop {
         draw_drop(s, &vp, d);
     }
+    if let Some(f) = dropped {
+        draw_dropped(g, s, &vp, f);
+    }
+    if inspect {
+        draw_inspect(g, s, &vp);
+    }
+    if let Some((c, r, h)) = body {
+        for (a, b) in capsule_shape(c, r, h, 1).edges {
+            world_line(&mut s.lines, &vp, a, b, [1.0, 1.0, 1.0, 0.8]);
+        }
+    }
+    draw_trials(s, &vp);
 }
 
-/// The float as it would appear if dropped now, and a line down to where it would land.
+/// Where the float ended up after the last test drops, colored by how each went; every spot tried,
+/// from red (never works) to green (always works); and the best line up: a ring where to stand, an
+/// arrow where to face, a cross where to aim for the horn.
+fn draw_trials(s: &mut State, vp: &Mat4) {
+    for t in s.trials.iter().rev().take(40) {
+        let mut edges = Vec::new();
+        for i in 0..3 {
+            arc(&mut edges, t.float_pos, AXES[i], AXES[(i + 1) % 3], 0.08, 0.0, TAU);
+        }
+        add_lines(&mut s.lines, vp, edges, t.outcome.color());
+    }
+    let (from, to) = s.run_slots;
+    let Some(a) = s.slots.get(from) else { return };
+    let b = to.and_then(|i| s.slots.get(i));
+    let n = spot_count(a, b);
+    for (i, &(tries, ok)) in spot_stats(&s.trials, n).iter().enumerate().filter(|(_, st)| st.0 > 0) {
+        let rate = ok as f32 / tries as f32;
+        let mut edges = Vec::new();
+        arc(&mut edges, spot_at(a, b, i, n).pos, AXES[0], AXES[2], 0.025, 0.0, TAU);
+        add_lines(&mut s.lines, vp, edges, [1.0 - rate, rate, 0.2, 1.0]);
+    }
+    let Some(l) = lineup(s) else { return };
+    let white = [1.0; 4];
+    let (pos, yaw) = (l.saved.pos, l.yaw.to_radians());
+    let fwd = V3 { x: yaw.sin(), y: 0.0, z: yaw.cos() };
+    let right = V3 { x: fwd.z, y: 0.0, z: -fwd.x };
+    let tip = pos.add_scaled(fwd, 1.0);
+    let back = tip.add_scaled(fwd, -0.15);
+    let mut edges = vec![(pos, tip), (tip, back.add_scaled(right, 0.08)), (tip, back.add_scaled(right, -0.08))];
+    arc(&mut edges, pos, AXES[0], AXES[2], 0.12, 0.0, TAU);
+    add_lines(&mut s.lines, vp, edges, white);
+    if let Some(p) = vp.project(tip) {
+        s.labels.push((p, format!("line up : {}/{}", l.own.1, l.own.0), white));
+    }
+    if let Some(g) = l.grab {
+        add_lines(&mut s.lines, vp, AXES.iter().map(|&ax| (g.add_scaled(ax, -0.05), g.add_scaled(ax, 0.05))), white);
+        if let Some(p) = vp.project(g) {
+            s.labels.push((p, "vise ici".into(), white));
+        }
+    }
+}
+
+/// World-space segments to overlay lines, minus what's behind the camera.
+fn add_lines(lines: &mut Vec<Line>, vp: &Mat4, edges: impl IntoIterator<Item = (V3, V3)>, color: [f32; 4]) {
+    for (a, b) in edges {
+        if let [a, b, ..] = clip_front(&[vp.point(a), vp.point(b)])[..] {
+            lines.push(Line { a, b, color });
+        }
+    }
+}
+
+/// A world-space segment as an overlay line, cut to what's in front of the camera.
+fn world_line(out: &mut Vec<Line>, vp: &Mat4, a: V3, b: V3, color: [f32; 4]) {
+    if let [a, b, ..] = clip_front(&[vp.point(a), vp.point(b)])[..] {
+        out.push(Line { a, b, color });
+    }
+}
+
+/// The float as it would appear if dropped now (the game's sphere and its real shape), and a line
+/// down to where it would land.
 fn draw_drop(s: &mut State, vp: &Mat4, d: DropInfo) {
     let color = d.color();
-    let mut edges = Vec::new();
-    for i in 0..3 {
-        arc(&mut edges, d.pos, AXES[i], AXES[(i + 1) % 3], d.radius, 0.0, TAU);
-    }
+    let mut edges = sphere_shape(d.pos, d.radius).edges;
     if let Some(land) = d.land {
         edges.push((d.pos, land));
         arc(&mut edges, land, AXES[0], AXES[2], d.radius, 0.0, TAU);
     }
     for (a, b) in edges {
-        if let [a, b, ..] = clip_front(&[vp.point(a), vp.point(b)])[..] {
-            s.lines.push(Line { a, b, color });
+        world_line(&mut s.lines, vp, a, b, color);
+    }
+    if let Some(m) = s.drop_model {
+        let mut lines = Vec::new();
+        for (in_float, shape) in &s.float_shapes {
+            let m = m.mul(in_float);
+            for &(a, b) in &shape.edges {
+                world_line(&mut lines, vp, m.apply(a), m.apply(b), d.roof_color());
+            }
         }
+        s.lines.extend(lines);
     }
     if let Some(p) = vp.project(d.pos) {
         s.labels.push((p, format!("DROP : {}", d.label()), color));
     }
 }
 
+pub const FLOAT_COLOR: [f32; 4] = [1.0, 0.35, 0.9, 1.0];
+
+/// The float lying where it was dropped, through walls and roof: what to aim at to grab it back.
+unsafe fn draw_dropped(g: &G, s: &mut State, vp: &Mat4, float: P) {
+    let world = call!(g.tr_matrix, fn(P) -> Mat4, call!(g.comp_transform, fn(P) -> P, float));
+    let color = [1.0, 0.3, 1.0, 1.0];
+    let mut lines = Vec::new();
+    // Where it went after the drop, from where it appeared.
+    let trail: Vec<&V3> = if s.show_trail { s.drop_spawn.iter().chain(&s.drop_trail).collect() } else { Vec::new() };
+    for w in trail.windows(2) {
+        world_line(&mut lines, vp, *w[0], *w[1], [1.0, 0.3, 1.0, 0.6]);
+    }
+    for (in_float, shape) in &s.float_shapes {
+        let m = world.mul(in_float);
+        for &(a, b) in &shape.edges {
+            world_line(&mut lines, vp, m.apply(a), m.apply(b), color);
+        }
+    }
+    s.lines.extend(lines);
+    let top = world.apply(V3::default()).add_scaled(AXES[1], s.float_top);
+    if let Some(p) = vp.project(top) {
+        let below = s.pos.y - top.y;
+        s.labels.push((p, format!("BOUEE : vise-la + E (sommet {below:.1} m sous tes pieds)"), color));
+    }
+}
+
+/// QueryTriggerInteraction.Ignore
+const IGNORE_TRIGGERS: i32 = 1;
+
+/// Layer mask of what `layer` collides with, minus `skip`.
+unsafe fn collision_mask(g: &G, layer: i32, skip: &[i32]) -> i32 {
+    (0..32)
+        .filter(|l| !skip.contains(l) && !call!(g.ignore_layers, fn(i32, i32) -> bool, layer, *l))
+        .fold(0i32, |m, l| m | 1 << l)
+}
+
+/// Which way from the player's body an offset points. GetSafeDropPosition puts the float at feet
+/// height + dropHeight, in the first clear direction among front, right, back, left of the body
+/// (the camera's pitch plays no part), or right above if none is.
+fn side_of(d: V3, fwd: V3, right: V3) -> &'static str {
+    let (f, r) = (d.dot(fwd), d.dot(right));
+    if f.abs().max(r.abs()) < 0.05 {
+        "au-dessus de toi"
+    } else if f.abs() >= r.abs() {
+        if f > 0.0 { "devant" } else { "derriere" }
+    } else if r > 0.0 {
+        "a droite"
+    } else {
+        "a gauche"
+    }
+}
+
+/// A mesh collider's own triangles (a convex one's hull hugs them), or its bounds if unreadable:
+/// no raycast sampling, which needs the collider enabled.
+unsafe fn plain_mesh_shape(g: &G, col: P) -> Option<Shape> {
+    let mesh = call!(g.mc_mesh, fn(P) -> P, col);
+    if !alive(mesh) {
+        return None;
+    }
+    if call!(g.mesh_readable, fn(P) -> bool, mesh) {
+        let idx: Vec<i32> = il2cpp::values(call!(g.mesh_triangles, fn(P) -> P, mesh));
+        if idx.len() <= 3 * MAX_MESH_TRIS {
+            let verts: Vec<V3> = il2cpp::values(call!(g.mesh_vertices, fn(P) -> P, mesh));
+            return Some(Shape { edges: outline(&verts, &idx), ..Default::default() });
+        }
+    }
+    let b = call!(g.mesh_bounds, fn(P) -> Bounds, mesh);
+    Some(Shape { approx: true, ..box_shape(b.center, b.extents) })
+}
+
+/// The float's colliders in its own space and how high it reaches above its pivot once upright.
+/// Read while carried, with its colliders disabled.
+unsafe fn float_shapes(g: &G, float: P) -> (Vec<(Mat4, Shape)>, f32) {
+    let tr = call!(g.comp_transform, fn(P) -> P, float);
+    let (to_float, scale) = (call!(g.tr_inverse, fn(P) -> Mat4, tr), call!(g.tr_scale, fn(P) -> V3, tr));
+    let shapes: Vec<(Mat4, Shape)> = il2cpp::array(rd(float, g.off_floater_colliders))
+        .into_iter()
+        .filter(|&c| alive(c))
+        .filter_map(|c| {
+            let k = (il2cpp::api().object_get_class)(c);
+            let drawn = if k == g.k_mesh { plain_mesh_shape(g, c)? } else { shape(g, c, k, &mut 0)? };
+            let m = call!(g.tr_matrix, fn(P) -> Mat4, call!(g.comp_transform, fn(P) -> P, c));
+            Some((to_float.mul(&m), drawn))
+        })
+        .collect();
+    let top = shapes
+        .iter()
+        .flat_map(|(m, shape)| shape.edges.iter().flat_map(move |&(a, b)| [m.apply(a).y, m.apply(b).y]))
+        .fold(f32::NEG_INFINITY, f32::max);
+    (shapes, if top.is_finite() { top * scale.y.abs() } else { 0.0 })
+}
+
+/// Distance to the first solid thing for `mask` along a ray (a thin sphere cast).
+unsafe fn ray(g: &G, from: V3, dir: V3, max: f32, mask: i32) -> Option<f32> {
+    let mut hit = Hit::default();
+    call!(g.sphere_cast, fn(V3, f32, V3, *mut Hit, f32, i32, i32) -> bool, from, 0.02, dir, &mut hit, max, mask, IGNORE_TRIGGERS)
+        .then_some(hit.distance)
+}
+
 /// Where the carried float would go if dropped now: the game's own GetSafeDropPosition (what
-/// CmdDrop uses), then a sphere cast down to where it would land.
-unsafe fn drop_preview(g: &G, float: P, player_tr: P, player_layer: i32) -> DropInfo {
+/// CmdDrop uses), a sphere cast down to where it would land, and how far its top would stick out
+/// of the roof above (UserCode_CmdDrop turns it to the player's yaw). Also gives where its shapes
+/// (`float_top` high) would be drawn.
+unsafe fn drop_preview(g: &G, float: P, player_tr: P, player_layer: i32, float_top: f32) -> (DropInfo, Mat4) {
     let pos = call!(g.carry_drop_pos, fn(P, P) -> V3, float, player_tr);
+    let feet = call!(g.tr_get_pos, fn(P) -> V3, player_tr);
+    let (fwd, right) = (call!(g.tr_forward, fn(P) -> V3, player_tr), call!(g.tr_right, fn(P) -> V3, player_tr));
+    let side = side_of(pos.sub(feet), fwd, right);
     let scale = call!(g.tr_scale, fn(P) -> V3, call!(g.comp_transform, fn(P) -> P, float));
     let radius = rd::<f32>(float, g.off_floater_radius) * scale.x.abs();
     // What the float collides with, minus players: it would land on you instead.
     let layer = call!(g.go_layer, fn(P) -> i32, call!(g.comp_gameobject, fn(P) -> P, float));
-    let mask = (0..32)
-        .filter(|&l| l != player_layer && !call!(g.ignore_layers, fn(i32, i32) -> bool, layer, l))
-        .fold(0i32, |m, l| m | 1 << l);
-    const IGNORE_TRIGGERS: i32 = 1;
+    let mask = collision_mask(g, layer, &[player_layer]);
     let inside = call!(g.check_sphere, fn(V3, f32, i32, i32) -> bool, pos, radius * 0.9, mask, IGNORE_TRIGGERS);
-    let down = V3 { x: 0.0, y: -1.0, z: 0.0 };
+    let (up, down) = (AXES[1], AXES[1].scale(-1.0));
     let mut hit = Hit::default();
     let land = call!(g.sphere_cast, fn(V3, f32, V3, *mut Hit, f32, i32, i32) -> bool, pos, radius, down, &mut hit, 500.0, mask, IGNORE_TRIGGERS)
         .then(|| pos.add_scaled(down, hit.distance));
-    DropInfo { pos, radius, land, inside }
+    let rest = if inside { pos } else { land.unwrap_or(pos) };
+    let top = roof_margin(g, feet.add_scaled(up, 0.5), rest, float_top, collision_mask(g, layer, &[player_layer, layer]));
+    let flat = |v: V3| {
+        let v = V3 { y: 0.0, ..v };
+        v.scale(1.0 / v.dot(v).sqrt().max(1e-6))
+    };
+    let model = Mat4::from_basis(flat(right).scale(scale.x), up.scale(scale.y), flat(fwd).scale(scale.z), rest);
+    (DropInfo { pos, radius, land, inside, side, top, on_player: false }, model)
+}
+
+/// How far a float resting at `base`, its top `top` m above it, sticks out of the roof over it
+/// (negative: under it), if there's one: the ceiling found going up from `from`, then the roof's
+/// upper face over `base`, found from above. `mask` leaves players and floats out.
+unsafe fn roof_margin(g: &G, from: V3, base: V3, top: f32, mask: i32) -> Option<f32> {
+    let (up, down) = (AXES[1], AXES[1].scale(-1.0));
+    ray(g, from, up, 10.0, mask).map(|d| {
+        let above = V3 { y: from.y + d + 3.0, ..base };
+        let roof = ray(g, above, down, 3.0, mask).map_or(from.y + d, |d| above.y - d);
+        base.y + top - roof
+    })
+}
+
+/// Where a dropped float ended up once settled.
+#[derive(Clone, Copy)]
+pub struct Landed {
+    /// Its top against the roof above (negative: under it), if there's one.
+    top: Option<f32>,
+    /// How far below where it appeared.
+    fell: f32,
+    at: Instant,
+}
+
+impl Landed {
+    pub fn recent(&self) -> bool {
+        self.at.elapsed() < PUSH_SHOWN
+    }
+
+    pub fn label(&self) -> String {
+        match self.top {
+            _ if self.fell > 1.0 => format!("tombee de {:.1} m", self.fell),
+            Some(t) if t > 0.0 => format!("contre le toit, depasse de {:.0} cm : vise-la d'en haut + E", t * 100.0),
+            Some(t) => format!("restee en haut, {:.0} cm sous le toit", -t * 100.0),
+            None => "restee en haut, pas de toit au-dessus".into(),
+        }
+    }
+
+    pub fn color(&self) -> [f32; 4] {
+        match self.top {
+            _ if self.fell > 1.0 => [1.0, 0.2, 0.2, 1.0],
+            Some(t) if t > 0.0 => [0.2, 1.0, 0.3, 1.0],
+            _ => [1.0, 0.6, 0.1, 1.0],
+        }
+    }
+}
+
+/// Does a sphere overlap the player's upright capsule (center, radius, height)?
+fn sphere_in_capsule(c: V3, r: f32, (cc, cr, ch): (V3, f32, f32)) -> bool {
+    let half = (ch / 2.0 - cr).max(0.0);
+    let y = c.y.clamp(cc.y - half, cc.y + half);
+    c.dist(V3 { y, ..cc }) < r + cr
+}
+
+/// The player's CharacterController in world space: (center, radius, height). Always upright.
+unsafe fn capsule(g: &G, cc: P) -> (V3, f32, f32) {
+    let tr = call!(g.comp_transform, fn(P) -> P, cc);
+    let center = call!(g.tr_matrix, fn(P) -> Mat4, tr).apply(call!(g.cc_center, fn(P) -> V3, cc));
+    (center, call!(g.cc_radius, fn(P) -> f32, cc), call!(g.cc_height, fn(P) -> f32, cc))
+}
+
+unsafe fn collect_colliders(g: &G, tr: P, depth: u32, out: &mut Vec<P>) {
+    out.extend(il2cpp::array(call!(g.get_components, fn(P, P) -> P, tr, g.t_collider)));
+    if depth < 8 {
+        for i in 0..call!(g.tr_child_count, fn(P) -> i32, tr) {
+            collect_colliders(g, call!(g.tr_get_child, fn(P, i32) -> P, tr, i), depth + 1, out);
+        }
+    }
+}
+
+/// Shapes of the inspected copy's colliders and where they sit in the pivot (AddInspectionCollider
+/// only makes readable meshes and boxes: no raycast sampling needed).
+unsafe fn item_shapes(g: &G, item: P, pivot: P) -> Vec<(Mat4, Shape)> {
+    let to_pivot = call!(g.tr_inverse, fn(P) -> Mat4, pivot);
+    let mut cols = Vec::new();
+    collect_colliders(g, call!(g.go_transform, fn(P) -> P, item), 0, &mut cols);
+    cols.into_iter()
+        .filter_map(|c| {
+            let drawn = shape(g, c, (il2cpp::api().object_get_class)(c), &mut 0)?;
+            let m = call!(g.tr_matrix, fn(P) -> Mat4, call!(g.comp_transform, fn(P) -> P, c));
+            Some((to_pivot.mul(&m), drawn))
+        })
+        .collect()
+}
+
+/// Was something solid for the player in the way between two points (what the push went through)?
+unsafe fn blocked(g: &G, from: V3, to: V3, player_layer: i32) -> bool {
+    let len = from.dist(to);
+    if len < 0.05 {
+        return false;
+    }
+    let mask = collision_mask(g, player_layer, &[player_layer, INSPECT_LAYER]);
+    let mut hit = Hit::default();
+    let dir = to.sub(from).scale(1.0 / len);
+    call!(g.sphere_cast, fn(V3, f32, V3, *mut Hit, f32, i32, i32) -> bool, from, 0.05, dir, &mut hit, len, mask, IGNORE_TRIGGERS)
+}
+
+/// Follows the game's item inspection: copies the item's shape for the preview and measures the push.
+/// `before`: the player capsule last frame.
+unsafe fn track_inspection(
+    g: &G,
+    ins: &Inspection,
+    s: &mut State,
+    cc: P,
+    before: Option<(V3, f32, f32)>,
+    (ctrl, tr, stats, inv, carried): (P, P, P, P, Option<P>),
+) {
+    let ui = call!(ins.singleton, fn() -> P);
+    let Some((center, radius, height)) = s.capsule else { return };
+    if !alive(ui) || !alive(cc) {
+        return;
+    }
+    let layer = call!(g.go_layer, fn(P) -> i32, call!(g.comp_gameobject, fn(P) -> P, cc));
+    s.inspect_solid = Some(!call!(g.ignore_layers, fn(i32, i32) -> bool, layer, INSPECT_LAYER));
+    let now = Instant::now();
+    let inspecting = call!(ins.is_inspecting, fn() -> bool);
+    // Last frame's position: the push may already have happened this frame.
+    let from = before.map_or(center, |c| c.0);
+    if inspecting && !s.push_was_open {
+        // A new inspection before the last one played out: take its end result from before this push.
+        if let Some(p) = s.push.as_mut() {
+            p.finish(from, now);
+        }
+        archive_push(s);
+        // Opening frame: the pivot is still where ShowInspectable put it, unrotated.
+        let (item, pivot): (P, P) = (rd(ui, ins.off_current), rd(ui, ins.off_pivot));
+        if alive(item) && alive(pivot) {
+            s.inspect_item = name_of(g, item);
+            s.inspect_shapes = item_shapes(g, item, pivot);
+        }
+        let cam = call!(g.player_camera, fn() -> P);
+        let (fwd, right) = if alive(cam) {
+            let t = call!(g.comp_transform, fn(P) -> P, cam);
+            (call!(g.tr_forward, fn(P) -> V3, t), call!(g.tr_right, fn(P) -> V3, t))
+        } else {
+            (V3 { x: 0.0, y: 0.0, z: 1.0 }, V3 { x: 1.0, y: 0.0, z: 0.0 })
+        };
+        let frame = Frame::from_camera_right(right);
+        let pose = g.off_pose.map_or(Pose::Inconnue, |(crawl, crouch)| {
+            if rd::<bool>(ctrl, crawl) {
+                Pose::Allonge
+            } else if rd::<bool>(ctrl, crouch) {
+                Pose::Accroupi
+            } else {
+                Pose::Debout
+            }
+        });
+        // The wall behind (see wall_from_casts). A cast starting inside a collider doesn't see it:
+        // the near face is looked for from in front of the player (who may already be in the wall),
+        // what lies behind the wall from just inside it, and the far face coming back from there.
+        const PROBE: f32 = 3.0;
+        let mask = collision_mask(g, layer, &[layer, INSPECT_LAYER]);
+        let back = frame.fwd.scale(-1.0);
+        let offset = radius + 0.3;
+        let front_hit = ray(g, from.add_scaled(frame.fwd, offset), back, s.push_wall_probe + offset, mask);
+        let (gap, return_hit) = match front_hit {
+            Some(h) => {
+                let inside = from.add_scaled(back, h - offset + WALL_INSIDE);
+                let gap = ray(g, inside, back, PROBE, mask);
+                let span = gap.map_or(PROBE, |g| WALL_INSIDE + g);
+                (gap, ray(g, from.add_scaled(back, h - offset + span), frame.fwd, span, mask))
+            },
+            None => (None, None),
+        };
+        let mut start = snapshot(g, s, ctrl, tr, stats, inv, carried);
+        start.pos = start_position(start.pos, center, from);
+        let start = Some(start);
+        s.push_n += 1;
+        s.push = Some(PushRecord {
+            n: s.push_n,
+            item: s.inspect_item.clone(),
+            yaw: frame.yaw_deg(),
+            pitch: pitch_down_deg(fwd),
+            pose,
+            from,
+            radius,
+            height,
+            frame,
+            opened: now,
+            closed: None,
+            open: Split::default(),
+            max: 0.0,
+            settled: None,
+            wall: wall_from_casts(front_hit, offset, gap, return_hit, PROBE),
+            crossed: false,
+            trail: vec![from],
+            start,
+        });
+    }
+    let (settle, was_open) = (s.push_settle, s.push_was_open);
+    s.push_was_open = inspecting;
+    let Some(p) = s.push.as_mut().filter(|p| p.settled.is_none()) else { return };
+    let d = center.sub(p.from);
+    // The push itself happens within a frame or two of the opening.
+    if now.duration_since(p.opened).as_secs_f32() <= PUSH_OPEN_WINDOW {
+        let split = p.frame.split(d);
+        if split.len() >= p.open.len() {
+            p.open = split;
+        }
+    }
+    p.max = p.max.max(d.len());
+    if p.trail.last().is_none_or(|l| l.dist(center) > 0.01) {
+        p.trail.push(center);
+    }
+    if was_open && !inspecting {
+        // Without a wall found behind, something solid crossed by the push is the only sign of a
+        // traversal (with one, the far face tells: a cast into a wall the player is stuck in hits it).
+        // Checked now, before the player walks off.
+        let crossed = p.wall.is_none() && blocked(g, p.from, center, layer);
+        p.close(now, crossed);
+    }
+    if p.closed.is_some_and(|t| now.duration_since(t).as_secs_f32() >= settle) {
+        p.finish(center, now);
+        archive_push(s);
+    }
+}
+
+/// Copies the finished push into the history, once.
+fn archive_push(s: &mut State) {
+    if let Some(p) = s.push.as_ref().filter(|p| p.settled.is_some()) {
+        if s.push_log.last().is_none_or(|l| l.n != p.n) {
+            s.push_log.push(p.clone());
+            let over = s.push_log.len().saturating_sub(s.push_log_max.max(1));
+            s.push_log.drain(..over);
+        }
+    }
+}
+
+/// The player's state as a savestate.
+unsafe fn snapshot(g: &G, s: &State, ctrl: P, tr: P, stats: P, inv: P, carried: Option<P>) -> Saved {
+    let rot = call!(g.tr_get_rot, fn(P) -> Quat, tr);
+    let items = if alive(inv) { inventory(g, inv, &s.items) } else { Vec::new() };
+    let float = carried.map_or(0, |f| f as usize);
+    let (look, boost) = (rd(ctrl, g.off_look), (rd(stats, g.off_boost), rd(stats, g.off_boost_timer)));
+    Saved { pos: s.pos, rot, stats: s.stats, items, float, look, boost }
+}
+
+/// The inspected item where inspecting now would put it, the player's capsule, the last push.
+unsafe fn draw_inspect(g: &G, s: &mut State, vp: &Mat4) {
+    if g.insp.is_none() {
+        return;
+    }
+    let (mut lines, mut polys, mut labels) = (Vec::new(), Vec::new(), Vec::new());
+    let cam = call!(g.player_camera, fn() -> P);
+    if s.inspect_preview && !s.inspect_shapes.is_empty() && alive(cam) {
+        // With the free camera on, the player camera is at the free view while rendering: its real
+        // pose (where the game will spawn the item from) is the one begin_context saved.
+        let (eye, fwd) = match s.cam_saved {
+            Some((p, r)) => (p, r.rotate(AXES[2])),
+            None => {
+                let tr = call!(g.comp_transform, fn(P) -> P, cam);
+                (call!(g.tr_get_pos, fn(P) -> V3, tr), call!(g.tr_forward, fn(P) -> V3, tr))
+            },
+        };
+        let spawn = eye.add_scaled(fwd, INSPECT_DISTANCE);
+        // ShowInspectable moves the pivot there with no rotation; the item keeps its place in it.
+        let to_spawn = Mat4::translation(spawn);
+        let color = [0.2, 0.9, 1.0, 1.0];
+        for (in_pivot, shape) in &s.inspect_shapes {
+            let m = to_spawn.mul(in_pivot);
+            for &(a, b) in &shape.edges {
+                world_line(&mut lines, vp, m.apply(a), m.apply(b), color);
+            }
+            for face in &shape.faces {
+                let pts = clip_front(&face.map(|p| vp.point(m.apply(p))));
+                if pts.len() >= 3 {
+                    polys.push(Poly { pts, color: [color[0], color[1], color[2], s.inspect_fill] });
+                }
+            }
+        }
+        if let Some(p) = vp.project(spawn) {
+            labels.push((p, format!("INSPECT : {}", s.inspect_item), color));
+        }
+        if let Some((c, r, h)) = s.capsule {
+            for (a, b) in capsule_shape(c, r, h, 1).edges {
+                world_line(&mut lines, vp, a, b, [1.0, 1.0, 1.0, 0.6]);
+            }
+        }
+    }
+    if let Some(p) = s.push_recent() {
+        let to = *p.trail.last().unwrap_or(&p.from);
+        let color = p.verdict().map_or([1.0; 4], |v| v.color());
+        if s.show_push_ghost {
+            for (a, b) in capsule_shape(p.from, p.radius, p.height, 1).edges {
+                world_line(&mut lines, vp, a, b, [0.8, 0.8, 0.8, 0.45]);
+            }
+        }
+        if s.show_push_body {
+            for (a, b) in capsule_shape(to, p.radius, p.height, 1).edges {
+                world_line(&mut lines, vp, a, b, color);
+            }
+            if let Some(at) = vp.project(to) {
+                labels.push((at, p.hud(), color));
+            }
+        }
+        if s.show_push_arrow && p.from.dist(to) > 0.02 {
+            let dir = to.sub(p.from).scale(1.0 / p.from.dist(to));
+            let side = AXES[1].cross(dir);
+            let side = if side.len() < 1e-3 { p.frame.right } else { side.scale(1.0 / side.len()) };
+            let head = to.add_scaled(dir, -0.06);
+            for (a, b) in [(p.from, to), (to, head.add_scaled(side, 0.04)), (to, head.add_scaled(side, -0.04))] {
+                world_line(&mut lines, vp, a, b, color);
+            }
+        }
+        if s.show_push_trail {
+            for w in p.trail.windows(2) {
+                world_line(&mut lines, vp, w[0], w[1], [1.0, 1.0, 1.0, 0.6]);
+            }
+        }
+        if let Some(w) = p.wall.filter(|_| s.show_push_wall) {
+            // Each face as a 50 cm square across the push, at the capsule center's height.
+            let grey = [0.75, 0.75, 0.75, 0.9];
+            for (i, dist) in [w.near, w.far].into_iter().enumerate() {
+                let c = p.from.add_scaled(p.frame.fwd, -dist);
+                let (r, u) = (p.frame.right.scale(0.25), AXES[1].scale(0.25));
+                let q = [c.add_scaled(r, 1.0).add_scaled(u, 1.0), c.add_scaled(r, -1.0).add_scaled(u, 1.0), c.add_scaled(r, -1.0).add_scaled(u, -1.0), c.add_scaled(r, 1.0).add_scaled(u, -1.0)];
+                for k in 0..4 {
+                    world_line(&mut lines, vp, q[k], q[(k + 1) % 4], grey);
+                }
+                if i == 0 {
+                    if let Some(at) = vp.project(c.add_scaled(u, 1.2)) {
+                        labels.push((at, format!("mur : epaisseur {:.0} cm", w.thickness() * 100.0), grey));
+                    }
+                }
+            }
+        }
+    }
+    // The real copy where the game put it, turning with the mouse, while the inspection is open.
+    if let Some(ins) = g.insp.as_ref().filter(|_| s.show_push_copy) {
+        let ui = call!(ins.singleton, fn() -> P);
+        let pivot: P = if alive(ui) && call!(ins.is_inspecting, fn() -> bool) { rd(ui, ins.off_pivot) } else { std::ptr::null_mut() };
+        if alive(pivot) {
+            let m = call!(g.tr_matrix, fn(P) -> Mat4, pivot);
+            for (in_pivot, shape) in &s.inspect_shapes {
+                let m = m.mul(in_pivot);
+                for &(a, b) in &shape.edges {
+                    world_line(&mut lines, vp, m.apply(a), m.apply(b), [0.6, 0.8, 1.0, 1.0]);
+                }
+            }
+        }
+    }
+    s.lines.extend(lines);
+    s.polys.extend(polys);
+    s.labels.extend(labels);
 }
 
 unsafe fn draw_colliders(g: &G, s: &mut State, eye: V3, vp: &Mat4) {
-    let radius = s.collider_radius;
-    // Fading with distance makes what's close stand out from what's behind it.
-    let fade = |p: V3| (1.0 - p.dist(eye) / radius).clamp(0.15, 1.0);
     for col in &s.colliders {
         let info = &col.info;
         let wanted = match info.kind {
             Kind::Solid => s.show_colliders && s.show_visible_walls,
             Kind::Invisible => s.show_colliders,
             Kind::Trigger | Kind::Special => s.show_triggers,
+            Kind::Exit => s.show_exits,
             Kind::Ignored => false,
         };
+        // Level ends are few and wanted from afar; the rest only around the player.
+        let exit = info.kind == Kind::Exit;
+        let radius = if exit { f32::INFINITY } else { s.collider_radius };
+        // Fading with distance makes what's close stand out from what's behind it.
+        let fade = |p: V3| if exit { 1.0 } else { (1.0 - p.dist(eye) / radius).clamp(0.15, 1.0) };
         if !wanted || !alive(col.obj as P) || aabb_dist(&col.bounds, eye) > radius || s.lines.len() >= MAX_LINES {
             continue;
         }
@@ -1247,6 +2635,7 @@ unsafe fn draw_colliders(g: &G, s: &mut State, eye: V3, vp: &Mat4) {
             Kind::Solid => ([0.35, 0.75, 1.0, 0.7], 0.0),
             Kind::Invisible => ([1.0, 0.55, 0.0, 1.0], 0.2),
             Kind::Trigger => ([1.0, 0.95, 0.2, 0.85], 0.08),
+            Kind::Exit => ([1.0, 0.3, 1.0, 1.0], 0.25),
             _ => ([1.0, 0.2, 0.2, 1.0], 0.16),
         };
         let alpha = |a: f32| [color[0], color[1], color[2], a];
@@ -1274,12 +2663,159 @@ unsafe fn draw_colliders(g: &G, s: &mut State, eye: V3, vp: &Mat4) {
             }
         }
         // Names only up close, or they pile up into an unreadable mess.
-        if !info.label.is_empty() && col.bounds.center.dist(eye) < radius.min(15.0) {
+        if !info.label.is_empty() && (exit || col.bounds.center.dist(eye) < radius.min(15.0)) {
             if let Some(p) = vp.project(col.bounds.center) {
                 s.labels.push((p, info.label.clone(), alpha(1.0)));
             }
         }
     }
+}
+
+/// How far E reaches (PlayerInteract.interactDistance).
+unsafe fn interact_reach(g: &G) -> f32 {
+    let it = call!(g.player_interact, fn() -> P);
+    if !alive(it) {
+        return 2.0;
+    }
+    field_of(it, "interactDistance").map_or(2.0, |o| rd(it, o))
+}
+
+/// Whether E would grab the float now: the screen centre meets one of its solid colliders within
+/// reach, with nothing solid in between (the roof hides all but what sticks out).
+unsafe fn crosshair_on_float(g: &G, cam: P, float: P, player_layer: i32, reach: f32) -> bool {
+    let cam_tr = call!(g.comp_transform, fn(P) -> P, cam);
+    let ray = Ray { origin: call!(g.tr_get_pos, fn(P) -> V3, cam_tr), dir: call!(g.tr_forward, fn(P) -> V3, cam_tr) };
+    let mut dist = f32::MAX;
+    for col in il2cpp::array(rd(float, g.off_floater_colliders)) {
+        let mut hit = Hit::default();
+        let solid = alive(col) && call!(g.col_enabled, fn(P) -> bool, col) && !call!(g.col_trigger, fn(P) -> bool, col);
+        if solid && call!(g.col_raycast, fn(P, Ray, *mut Hit, f32) -> bool, col, ray, &mut hit, reach) {
+            dist = dist.min(hit.distance);
+        }
+    }
+    if dist > reach {
+        return false;
+    }
+    let float_layer = call!(g.go_layer, fn(P) -> i32, call!(g.comp_gameobject, fn(P) -> P, float));
+    let mask = collision_mask(g, player_layer, &[player_layer, float_layer]);
+    let mut hit = Hit::default();
+    !call!(g.sphere_cast, fn(V3, f32, V3, *mut Hit, f32, i32, i32) -> bool, ray.origin, 0.01, ray.dir, &mut hit, dist, mask, IGNORE_TRIGGERS)
+}
+
+/// One step of the looping test per frame: load the next (spot, turn), let the float settle, turn
+/// the head until the preview is green, drop with the game's own CmdDrop body, then once through
+/// the roof look at the float and grab it like E would.
+unsafe fn run_repeat(g: &G, s: &mut State, ctrl: P, tr: P, carried: Option<P>, identity: P, player_layer: Option<i32>) {
+    let Some(mut r) = s.repeat.take() else { return };
+    let Some(a) = s.slots.get(r.from).cloned() else { return };
+    let b = r.to.and_then(|i| s.slots.get(i).cloned());
+    let spots = spot_count(&a, b.as_ref());
+    if r.greens.len() != spots {
+        r.greens = vec![None; spots];
+    }
+    let float = a.float as P;
+    let float_pos = || transform_pos(g, float).unwrap_or_default();
+    let turned = |r: &Repeat, k: usize| Quat::yaw(turn_deg(k)).mul(r.aim.0);
+    let green = || s.drop.is_some_and(|d| d.stays_up());
+    let side = || s.drop.map(|d| drop_side(s.pos, s.yaw, d.pos));
+    if matches!(r.phase, Phase::Settle(_) | Phase::Scan { .. } | Phase::Hold { .. }) && (carried != Some(float) || !alive(identity)) {
+        s.repeat_error = Some("Arrete : la bouee n'est pas revenue dans tes mains.");
+        return;
+    }
+    let phase = r.phase;
+    r.phase = match phase {
+        Phase::Load => {
+            match r.greens.iter().position(|g| g.is_none()) {
+                Some(i) => (r.spot, r.turn) = (i, None),
+                None => match next_cell(&cell_stats(&s.trials, spots), &green_cells(&r.greens, None)) {
+                    Some(c) => (r.spot, r.turn) = (c / TURNS, Some(c % TURNS)),
+                    None => {
+                        s.repeat_error = Some("Arrete : aucun angle ne donne de cercle vert.");
+                        return;
+                    },
+                },
+            }
+            let saved = spot_at(&a, b.as_ref(), r.spot, spots);
+            r.aim = (saved.rot, saved.look);
+            (r.grab, r.side) = (None, None);
+            s.actions.push(Action::LoadAt(saved));
+            Phase::Settle(0)
+        },
+        Phase::Settle(f) if f < SETTLE_FRAMES => {
+            // Undo any mouse movement: every try starts from the spot's aim.
+            call!(g.tr_set_rot, fn(P, Quat), tr, r.aim.0);
+            wr(ctrl, g.off_look, r.aim.1);
+            Phase::Settle(f + 1)
+        },
+        Phase::Settle(_) if r.turn.is_none() => {
+            r.scan.clear();
+            Phase::Scan { k: 0, frame: 0 }
+        },
+        Phase::Settle(_) => Phase::Hold { frame: 0, green: 0 },
+        Phase::Scan { k, frame } if k < TURNS => {
+            call!(g.tr_set_rot, fn(P, Quat), tr, turned(&r, k));
+            if frame + 1 < SEEK_HOLD {
+                Phase::Scan { k, frame: frame + 1 }
+            } else {
+                // You found the float tends to fall when the green circle is on your right.
+                r.scan.push(green() && !(s.skip_right && side() == Some(Side::Right)));
+                Phase::Scan { k: k + 1, frame: 0 }
+            }
+        },
+        Phase::Scan { .. } => {
+            r.greens[r.spot] = Some(std::mem::take(&mut r.scan));
+            match next_cell(&cell_stats(&s.trials, spots), &green_cells(&r.greens, Some(r.spot))) {
+                Some(c) => {
+                    r.turn = Some(c % TURNS);
+                    Phase::Hold { frame: 0, green: 0 }
+                },
+                None => {
+                    s.trials.push(Trial { spot: r.spot, turn: None, outcome: Outcome::NeverGreen, float_pos: float_pos(), grab: None, side: None });
+                    Phase::Load
+                },
+            }
+        },
+        Phase::Hold { frame, green: n } => {
+            let k = r.turn.unwrap_or(TURNS / 2);
+            call!(g.tr_set_rot, fn(P, Quat), tr, turned(&r, k));
+            let n = if frame > 0 && green() { n + 1 } else { 0 };
+            if n >= GREEN_FRAMES {
+                r.side = side();
+                call!(g.carry_drop, fn(P, P), float, identity);
+                Phase::Watch { t: 0.0, start_y: s.pos.y }
+            } else if frame >= HOLD_FRAMES {
+                // Green during the sweep but not now: a failed try of this line up.
+                s.trials.push(Trial { spot: r.spot, turn: Some(k), outcome: Outcome::NeverGreen, float_pos: float_pos(), grab: None, side: None });
+                Phase::Load
+            } else {
+                Phase::Hold { frame: frame + 1, green: n }
+            }
+        },
+        Phase::Watch { t, start_y } if t < WATCH_SECS => {
+            // Through the roof and empty-handed: look at the float's top and press E once it's under the crosshair.
+            if carried.is_none() && s.pos.y - start_y > ROOF_RISE {
+                if let (Some(target), Some(layer)) = (transform_pos(g, float).map(|p| V3 { y: p.y + s.float_top, ..p }), player_layer) {
+                    let target = V3 { y: target.y - 0.03, ..target };
+                    let d = target.sub(s.pos);
+                    call!(g.tr_set_rot, fn(P, Quat), tr, Quat::yaw(d.x.atan2(d.z).to_degrees()));
+                    call!(g.align_pitch, fn(P, V3, f32), ctrl, target, 1.0e4);
+                    let cam = rd::<P>(ctrl, g.off_camera);
+                    if alive(cam) && crosshair_on_float(g, cam, float, layer, interact_reach(g)) {
+                        call!(g.carry_pickup, fn(P, P), float, identity);
+                        r.grab = Some(target);
+                    }
+                }
+            }
+            Phase::Watch { t: t + call!(g.delta_time, fn() -> f32), start_y }
+        },
+        Phase::Watch { start_y, .. } => {
+            let outcome = classify(s.pos.y - start_y, carried == Some(float));
+            let grab = r.grab.filter(|_| outcome == Outcome::Success);
+            s.trials.push(Trial { spot: r.spot, turn: r.turn, outcome, float_pos: float_pos(), grab, side: r.side });
+            Phase::Load
+        },
+    };
+    s.repeat = Some(r);
 }
 
 /// Runs every frame on Unity's main thread, right after the local player's Update.
@@ -1292,6 +2828,16 @@ unsafe fn tick(g: &G, ctrl: P) {
         return;
     }
     s.last_tick = Some(Instant::now());
+
+    // Raw object pointers are only safe while Unity keeps the objects: drop them all on level change.
+    if s.controller != ctrl as usize {
+        s.controller = ctrl as usize;
+        (s.colliders, s.infos, s.last_scan) = (Vec::new(), BTreeMap::new(), None);
+        (s.floats, s.last_float_scan) = (Vec::new(), None);
+        (s.capsule, s.push, s.push_was_open) = (None, None, false);
+        (s.cam_saved, s.applied_free_cam) = (None, false);
+        (s.float_of_shapes, s.carried_last, s.dropped) = (0, 0, None);
+    }
 
     // Max values aren't exposed by the game: use the highest seen since this player spawned.
     if s.stats_obj != stats as usize {
@@ -1345,29 +2891,59 @@ unsafe fn tick(g: &G, ctrl: P) {
 
     let pos = call!(g.tr_get_pos, fn(P) -> V3, tr);
     let noclip = NOCLIP.load(Relaxed);
+    let cam = rd::<P>(ctrl, g.off_camera);
+    let free_cam = s.free_cam && alive(cam);
+    let cam_tr = if alive(cam) { call!(g.comp_transform, fn(P) -> P, cam) } else { std::ptr::null_mut() };
+    if free_cam && !s.applied_free_cam {
+        s.cam_pos = call!(g.tr_get_pos, fn(P) -> V3, cam_tr);
+        (s.cam_yaw, s.cam_pitch) = yaw_pitch_of(call!(g.tr_forward, fn(P) -> V3, cam_tr));
+        s.look_input = [0.0; 2];
+    }
+    if !free_cam {
+        if let Some((p, r)) = s.cam_saved.take().filter(|_| alive(cam)) {
+            call!(g.tr_set_pos, fn(P, V3), cam_tr, p);
+            call!(g.tr_set_rot, fn(P, Quat), cam_tr, r);
+        }
+    }
+    // The free camera turns with the mouse taken from the player (pc_update), at the game's speed.
+    if free_cam {
+        let speed = if alive(vars) { rd::<f32>(vars, g.off_look_speed) } else { 1.0 };
+        let [dx, dy] = std::mem::take(&mut s.look_input);
+        s.cam_yaw = (s.cam_yaw + dx * speed) % 360.0;
+        s.cam_pitch = (s.cam_pitch - dy * speed).clamp(-89.0, 89.0);
+    }
+    // The keys fly the free camera when it's on, the noclip body otherwise.
+    let step = if free_cam {
+        let (fwd, right) = yaw_pitch_axes(s.cam_yaw, s.cam_pitch);
+        fly_step(g, s, fwd, right)
+    } else if noclip && alive(cam) {
+        fly_step(g, s, call!(g.tr_forward, fn(P) -> V3, cam_tr), call!(g.tr_right, fn(P) -> V3, cam_tr))
+    } else {
+        V3::default()
+    };
+    if free_cam {
+        s.cam_pos = s.cam_pos.add_scaled(step, 1.0);
+    }
     if noclip {
         if !s.applied_noclip {
             s.fly_pos = pos;
         }
-        let cam = rd::<P>(ctrl, g.off_camera);
-        if alive(cam) && !s.menu_open && crate::game_focused() {
-            let cam_tr = call!(g.comp_transform, fn(P) -> P, cam);
-            let (fwd, right) = (call!(g.tr_forward, fn(P) -> V3, cam_tr), call!(g.tr_right, fn(P) -> V3, cam_tr));
-            let axis = |p: bool, n: bool| p as i32 as f32 - n as i32 as f32;
-            let speed = s.fly_speed * if key(VK_LSHIFT.0) { 3.0 } else { 1.0 } * call!(g.delta_time, fn() -> f32);
-            s.fly_pos = s
-                .fly_pos
-                .add_scaled(fwd, axis(key_at(SC_W), key_at(SC_S)) * speed)
-                .add_scaled(right, axis(key_at(SC_D), key_at(SC_A)) * speed)
-                .add_scaled(V3 { x: 0.0, y: 1.0, z: 0.0 }, axis(key(VK_SPACE.0), key(VK_LCONTROL.0)) * speed);
+        if !free_cam {
+            s.fly_pos = s.fly_pos.add_scaled(step, 1.0);
         }
+    }
+    let hold = noclip.then_some(s.fly_pos);
+    if let Some(p) = hold {
         // The CharacterController moved us during Update; override it and push the change to physics.
-        call!(g.tr_set_pos, fn(P, V3), tr, s.fly_pos);
+        call!(g.tr_set_pos, fn(P, V3), tr, p);
         call!(g.sync_transforms, fn());
         wr(ctrl, g.off_gravity, 0.0f32);
     }
     s.applied_noclip = noclip;
-    s.pos = if noclip { s.fly_pos } else { pos };
+    s.applied_free_cam = free_cam;
+    s.pos = hold.unwrap_or(pos);
+    let fwd = call!(g.tr_forward, fn(P) -> V3, tr);
+    s.yaw = fwd.x.atan2(fwd.z).to_degrees();
     s.game_time = call!(g.game_time, fn() -> f32);
 
     if s.time_scale != s.applied_time_scale {
@@ -1420,17 +2996,54 @@ unsafe fn tick(g: &G, ctrl: P) {
     let carried =
         s.floats.iter().map(|&f| f as P).find(|&f| my_id != 0 && alive(f) && rd::<u32>(f, g.off_carrier) == my_id);
     let cc = rd::<P>(ctrl, g.off_character);
-    s.drop = match carried {
+    let player_layer = alive(cc).then(|| call!(g.go_layer, fn(P) -> i32, call!(g.comp_gameobject, fn(P) -> P, cc)));
+    if let Some(f) = carried {
+        if s.float_of_shapes != f as usize {
+            (s.float_shapes, s.float_top) = float_shapes(g, f);
+            s.float_of_shapes = f as usize;
+        }
+        (s.carried_last, s.dropped) = (f as usize, None);
+    } else if s.carried_last != 0 {
+        // Just dropped it: keep it in sight to grab it back (last frame's preview says where it appeared).
+        s.dropped = Some((std::mem::take(&mut s.carried_last), Instant::now()));
+        (s.drop_spawn, s.landed, s.drop_trail) = (s.drop.map(|d| d.pos), None, Vec::new());
+    }
+    // Its path, and where it ends up once settled: followed until LANDED_BY after the drop.
+    if let Some((f, t)) = s.dropped.filter(|(f, t)| t.elapsed() <= LANDED_BY && s.floats.contains(f)) {
+        let float = f as P;
+        let pos = if alive(float) { transform_pos(g, float) } else { None };
+        if let Some(pos) = pos {
+            s.drop_trail.push(pos);
+        }
+        if let Some(pos) = pos.filter(|_| alive(cc) && t.elapsed() >= LANDED_AFTER) {
+            let player_layer = call!(g.go_layer, fn(P) -> i32, call!(g.comp_gameobject, fn(P) -> P, cc));
+            let layer = call!(g.go_layer, fn(P) -> i32, call!(g.comp_gameobject, fn(P) -> P, float));
+            let top = roof_margin(g, pos, pos, s.float_top, collision_mask(g, layer, &[player_layer, layer]));
+            let fell = s.drop_spawn.map_or(0.0, |p| p.y - pos.y);
+            s.landed = Some(Landed { top, fell, at: t });
+        }
+    }
+    (s.drop, s.drop_model) = match carried {
         Some(f) if s.drop_preview && alive(cc) => {
             let layer = call!(g.go_layer, fn(P) -> i32, call!(g.comp_gameobject, fn(P) -> P, cc));
-            Some(drop_preview(g, f, tr, layer))
+            let (info, model) = drop_preview(g, f, tr, layer, s.float_top);
+            (Some(info), Some(model))
         },
-        _ => None,
+        _ => (None, None),
     };
+    let before = s.capsule;
+    s.capsule = alive(cc).then(|| capsule(g, cc));
+    if let (Some(d), Some(body)) = (s.drop.as_mut(), s.capsule) {
+        d.on_player = sphere_in_capsule(d.pos, d.radius, body);
+    }
+    let inv = call!(g.player_inventory, fn() -> P);
+    if let Some(ins) = &g.insp {
+        track_inspection(g, ins, s, cc, before, (ctrl, tr, stats, inv, carried));
+    }
+    run_repeat(g, s, ctrl, tr, carried, identity, player_layer);
 
-    let cam = rd::<P>(ctrl, g.off_camera);
     s.camera = cam as usize;
-    if s.show_colliders || s.show_triggers {
+    if s.show_colliders || s.show_triggers || s.show_exits {
         let here = s.pos;
         if s.last_scan.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
             scan_colliders(g, s, ctrl, here);
@@ -1450,24 +3063,37 @@ unsafe fn tick(g: &G, ctrl: P) {
         s.items.sort();
     }
 
-    let inv = call!(g.player_inventory, fn() -> P);
     for action in std::mem::take(&mut s.actions) {
+        let action = match action {
+            Action::Load(i) => match s.slots.get(i) {
+                Some(saved) => {
+                    s.selected = i;
+                    Action::LoadAt(saved.clone())
+                },
+                None => continue,
+            },
+            other => other,
+        };
         match action {
             Action::Save => {
-                let rot = call!(g.tr_get_rot, fn(P) -> Quat, tr);
-                let items = if alive(inv) { inventory(g, inv, &s.items) } else { Vec::new() };
-                let float = carried.map_or(0, |f| f as usize);
-                s.slots.push(Saved { pos: s.pos, rot, stats: s.stats, items, float });
+                let saved = snapshot(g, s, ctrl, tr, stats, inv, carried);
+                s.slots.push(saved);
                 s.selected = s.slots.len() - 1;
             },
-            Action::Load(i) => {
-                let Some(saved) = s.slots.get(i).cloned() else { continue };
-                s.selected = i;
+            Action::Load(_) => unreachable!("turned into LoadAt above"),
+            Action::LoadAt(saved) => {
+                // A push still playing out would take its end result after the teleport: drop it.
+                if s.push.as_ref().is_some_and(|p| p.settled.is_none()) {
+                    s.push = None;
+                }
                 s.fly_pos = saved.pos;
-                call!(g.teleport, fn(P, V3, Quat, bool), ctrl, saved.pos, saved.rot, false);
+                teleport(g, ctrl, saved.pos, saved.rot, false);
+                wr(ctrl, g.off_look, saved.look);
                 for (off, v) in g.off_stats.iter().zip(saved.stats) {
                     wr(stats, *off, v);
                 }
+                wr(stats, g.off_boost, saved.boost.0);
+                wr(stats, g.off_boost_timer, saved.boost.1);
                 // Hand the float back (the server-side body of CmdPickup) unless we still carry it.
                 let float = saved.float as P;
                 if !float.is_null() && alive(float) && alive(identity) && carried != Some(float) {
@@ -1496,7 +3122,7 @@ unsafe fn tick(g: &G, ctrl: P) {
             Action::Goto(p) => {
                 s.fly_pos = p;
                 let rot = call!(g.tr_get_rot, fn(P) -> Quat, tr);
-                call!(g.teleport, fn(P, V3, Quat, bool), ctrl, p, rot, !noclip);
+                teleport(g, ctrl, p, rot, !noclip);
             },
             Action::ToggleEntity(id) => {
                 if let Some(&m) = monsters.iter().find(|&&m| m as usize == id) {
@@ -1505,8 +3131,43 @@ unsafe fn tick(g: &G, ctrl: P) {
                 }
             },
             Action::ScanPoints => s.points = scan_points(g),
+            Action::UnlockLevelsForever => s.unlock_msg = Some(unlock_levels_forever(g)),
         }
     }
+}
+
+/// The distinct unlock stats of (level, stat) pairs; stat 0 (COMPLETE_TIME) unlocks nothing.
+fn unlock_stats(levels: &[(i32, i32)]) -> Vec<i32> {
+    let mut stats: Vec<i32> = levels.iter().map(|&(_, stat)| stat).filter(|&stat| stat != 0).collect();
+    stats.sort_unstable();
+    stats.dedup();
+    stats
+}
+
+/// Does for every level what reaching it does in v0.7.0: its "REACH_*" stat set to 1 (saved
+/// with the player's Steam stats, so it stays) and the level opened right away.
+unsafe fn unlock_levels_forever(g: &G) -> String {
+    let Some(u) = &g.level_unlock else { return "Pas disponible dans cette version du jeu.".into() };
+    let mgr = call!(u.instance, fn() -> P);
+    if mgr.is_null() {
+        return "Progression du jeu introuvable : reessaie en pleine partie.".into();
+    }
+    let pairs: Vec<(i32, i32)> = g
+        .level_names
+        .iter()
+        .filter(|(v, _)| *v > 0 && *v < 9999) // not PLAYERS_LOBBY, UNKNOWN or EVENT_LEVEL
+        .filter_map(|&(v, _)| {
+            let info = call!(u.get_info, fn(i32) -> P, v);
+            (!info.is_null()).then(|| (v, rd::<i32>(info, u.off_stat)))
+        })
+        .collect();
+    let stats = unlock_stats(&pairs);
+    for &stat in &stats {
+        // Static, like ZoneReachStatTrigger calls it when a level is reached.
+        call!(u.set_stat, fn(i32, i32), stat, 1);
+        call!(u.mark, fn(P, i32), mgr, stat);
+    }
+    format!("{} niveaux debloques pour de bon.", stats.len())
 }
 
 /// Saves a Volume's weight the first time it is overridden, restores it when `off` goes false.
@@ -1530,7 +3191,7 @@ unsafe fn visuals(g: &G, cam: P) {
 
     // paniniProjection, vhsEffect, lensDistortion in off_fx: they warp the image away from the hitbox lines.
     const WARPING_FX: [usize; 3] = [3, 8, 9];
-    let hitboxes = s.show_colliders || s.show_triggers;
+    let hitboxes = s.show_colliders || s.show_triggers || s.show_exits;
     for (i, &off) in g.off_fx.iter().enumerate() {
         let c = rd::<P>(cam, off);
         if c.is_null() {
@@ -1657,6 +3318,9 @@ mod tests {
             radius: 0.4,
             land: land.map(|l| V3 { x: 0.0, y: l, z: 0.0 }),
             inside,
+            side: "devant",
+            top: None,
+            on_player: false,
         };
         let (green, orange, red) = ([0.2, 1.0, 0.3, 1.0], [1.0, 0.6, 0.1, 1.0], [1.0, 0.2, 0.2, 1.0]);
         assert_eq!(at(10.0, Some(9.7), false).color(), green); // lands on the roof
@@ -1664,7 +3328,44 @@ mod tests {
         assert_eq!(at(10.0, Some(2.0), false).color(), red); // back into the room
         assert_eq!(at(10.0, None, false).color(), red);
         assert_eq!(at(10.0, Some(9.7), true).color(), orange); // spawns inside the slab
-        assert_eq!(at(10.0, Some(2.0), false).label(), "retombe de 8.0 m");
+        assert_eq!(at(10.0, Some(2.0), false).label(), "devant : retombe de 8.0 m");
+        // The roof part: its top must stick out to grab it back from up there.
+        let roof = |top| DropInfo { top: Some(top), ..at(10.0, Some(9.8), false) };
+        assert_eq!(roof(0.12).label(), "devant : reste en haut (0.2 m) | depasse du toit de 12 cm");
+        assert_eq!(roof(0.12).roof_color(), green);
+        assert_eq!(roof(-0.3).label(), "devant : reste en haut (0.2 m) | sous le toit, il manque 30 cm");
+        assert_eq!(roof(-0.3).roof_color(), red);
+        // Inside the player: the boost, said as such, the roof verdict still there.
+        let in_body = DropInfo { on_player: true, ..roof(0.12) };
+        assert_eq!(in_body.label(), "devant : dans toi (te pousse) | reste en haut (0.2 m) | depasse du toit de 12 cm");
+        assert_eq!(in_body.roof_color(), green);
+        // Where it ended up after the drop.
+        let landed = |top, fell| Landed { top, fell, at: Instant::now() };
+        assert_eq!(landed(Some(0.05), 0.3).label(), "contre le toit, depasse de 5 cm : vise-la d'en haut + E");
+        assert_eq!(landed(Some(0.05), 0.3).color(), green);
+        assert_eq!(landed(Some(-0.4), 0.3).label(), "restee en haut, 40 cm sous le toit");
+        assert_eq!(landed(Some(0.05), 2.5).label(), "tombee de 2.5 m"); // fell off, wherever it is
+        assert_eq!(landed(Some(0.05), 2.5).color(), red);
+        // Player capsule 1.8 m tall, 0.4 m wide, centered at 1 m; a 0.5 m float around it.
+        let body = (V3 { x: 0.0, y: 1.0, z: 0.0 }, 0.4, 1.8);
+        assert!(sphere_in_capsule(V3 { x: 0.6, y: 1.5, z: 0.0 }, 0.5, body)); // chest height, beside
+        assert!(sphere_in_capsule(V3 { x: 0.0, y: 2.3, z: 0.0 }, 0.5, body)); // over the head
+        assert!(!sphere_in_capsule(V3 { x: 1.0, y: 1.5, z: 0.0 }, 0.5, body));
+        assert!(!sphere_in_capsule(V3 { x: 0.0, y: 2.8, z: 0.0 }, 0.5, body));
+        // Facing +Z: right is +X.
+        let (fwd, right) = (V3 { x: 0.0, y: 0.0, z: 1.0 }, V3 { x: 1.0, y: 0.0, z: 0.0 });
+        let side = |x: f32, z: f32| side_of(V3 { x, y: 1.5, z }, fwd, right);
+        assert_eq!(side(0.1, 0.8), "devant");
+        assert_eq!(side(0.0, -0.6), "derriere");
+        assert_eq!(side(0.7, 0.2), "a droite");
+        assert_eq!(side(-0.7, 0.2), "a gauche");
+        assert_eq!(side(0.01, -0.02), "au-dessus de toi");
+    }
+
+    #[test]
+    fn mat4_translation() {
+        let p = Mat4::translation(V3 { x: 1.0, y: 2.0, z: 3.0 }).apply(V3 { x: 1.0, y: 1.0, z: 1.0 });
+        assert_eq!(p, V3 { x: 2.0, y: 3.0, z: 4.0 });
     }
 
     #[test]
@@ -1674,6 +3375,128 @@ mod tests {
         }
         for n in ["Concrete Pillar_24_cacheCollider", "Metal_Barrier2_cacheCollider", "Inflatable_Ring_Unicorn"] {
             assert!(!invisible_name(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn repeat_trials_judged() {
+        assert_eq!(classify(2.5, true), Outcome::Success);
+        assert_eq!(classify(2.5, false), Outcome::HornHidden);
+        assert_eq!(classify(0.1, true), Outcome::NotThrough);
+        assert_eq!([turn_deg(0), turn_deg(TURNS / 2), turn_deg(TURNS - 1)], [-60.0, 0.0, 60.0]);
+        // A quarter turn to the right takes forward (+Z) to +X, as Unity does.
+        let q = Quat::yaw(90.0).mul(Quat::yaw(0.0)).0;
+        let (x, z) = (2.0 * (q[0] * q[2] + q[3] * q[1]), 1.0 - 2.0 * (q[0] * q[0] + q[1] * q[1]));
+        assert!((x - 1.0).abs() < 1e-5 && z.abs() < 1e-5);
+        assert!((yaw_of(Quat::yaw(30.0).mul(Quat::yaw(10.0))) - 40.0).abs() < 1e-3);
+        // Facing +X (yaw 90): +X is in front, -Z on the right, -X behind, +Z on the left.
+        let o = V3::default();
+        let side = |x, z| drop_side(o, 90.0, V3 { x, y: 0.0, z });
+        assert_eq!([side(1.0, 0.0), side(0.0, -1.0), side(-1.0, 0.0), side(0.0, 1.0)], Side::ALL);
+        let at = |x: f32| V3 { x, y: 0.0, z: 0.0 };
+        assert_eq!(spread(&[at(1.0), at(1.0)]), 0.0);
+        assert!((spread(&[at(0.0), at(0.3), at(-0.2)]) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spots_between_two_slots() {
+        let slot = |x: f32| Saved {
+            pos: V3 { x, y: 0.0, z: 0.0 },
+            rot: Quat([0.0, 0.0, 0.0, 1.0]),
+            stats: [0.0; 4],
+            items: Vec::new(),
+            float: 1,
+            look: V3 { x: 0.0, y: x * 10.0, z: 0.0 },
+            boost: (true, 0.0),
+        };
+        let (a, b) = (slot(0.0), slot(0.5));
+        assert_eq!(spot_count(&a, None), 1);
+        assert_eq!(spot_count(&a, Some(&b)), 11); // every 5 cm, both ends included
+        assert_eq!(spot_count(&a, Some(&slot(100.0))), MAX_SPOTS);
+        let mid = spot_at(&a, Some(&b), 5, 11);
+        assert!((mid.pos.x - 0.25).abs() < 1e-6 && (mid.look.y - 2.5).abs() < 1e-5);
+        assert_eq!(spot_at(&a, Some(&b), 10, 11).pos, b.pos);
+        let trial = |spot, turn, outcome| Trial { spot, turn, outcome, float_pos: V3::default(), grab: None, side: None };
+        let trials = [
+            trial(0, Some(3), Outcome::Success),
+            trial(1, Some(20), Outcome::Success),
+            trial(1, Some(20), Outcome::NotThrough),
+            trial(1, None, Outcome::NeverGreen),
+        ];
+        assert_eq!(spot_stats(&trials, 2), vec![(1, 1), (3, 1)]);
+        let cells = cell_stats(&trials, 2);
+        assert_eq!((cells[3], cells[TURNS + 20], cells[TURNS + 21]), ((1, 1), (2, 1), (0, 0)));
+    }
+
+    #[test]
+    fn best_line_up_forgives_errors() {
+        assert_eq!(best_cell(&[(0, 0)], 1), None);
+        assert_eq!(best_cell(&[(1, 1), (0, 0), (0, 0), (10, 9)], 1), Some(3)); // 9/10 beats a lucky 1/1
+        // One column: a 4/4 spot between two failing ones loses to a wide area working 3 times out of 4.
+        let stats = [(4, 0), (4, 4), (4, 0), (4, 3), (4, 3), (4, 3)];
+        assert_eq!(zone_stats(&stats, 1, 0), (8, 4));
+        assert_eq!(best_cell(&stats, 1), Some(4));
+        // Two spots of three turns: the zone spans both spots and the next turns.
+        let stats = [(1, 1), (2, 0), (0, 0), (3, 3), (1, 0), (0, 0)];
+        assert_eq!(zone_stats(&stats, 3, 0), (7, 4));
+        assert_eq!(zone_stats(&stats, 3, 5), (3, 0));
+    }
+
+    #[test]
+    fn test_focuses_on_what_works() {
+        let mut greens = vec![None; 2];
+        greens[1] = Some((0..TURNS).map(|k| k == 5 || k == 19 || k == 30).collect());
+        let cells = green_cells(&greens, None);
+        assert_eq!(cells, [TURNS + 5, TURNS + 19, TURNS + 30]);
+        assert_eq!(green_cells(&greens, Some(0)), []);
+        let mut stats = vec![(0, 0); 2 * TURNS];
+        assert_eq!(next_cell(&stats, &cells), Some(TURNS + 19)); // untried, closest to the slot's aim
+        for &c in &cells {
+            stats[c] = (10, 1);
+        }
+        stats[TURNS + 30] = (10, 9);
+        assert_eq!(next_cell(&stats, &cells), Some(TURNS + 30));
+        stats[TURNS + 5] = (1, 0);
+        assert_eq!(next_cell(&stats, &cells), Some(TURNS + 5)); // barely tried: worth another look
+        assert_eq!(next_cell(&stats, &[]), None);
+    }
+
+    #[test]
+    fn unlock_stats_skip_none_and_duplicates() {
+        // (level, its unlock stat): 0 is COMPLETE_TIME, never an unlock stat (the Lobby is always open).
+        assert_eq!(unlock_stats(&[(1, 0), (12, 56), (11, 60), (2, 1), (13, 56)]), vec![1, 56, 60]);
+    }
+
+    #[test]
+    fn quat_rotates_vectors() {
+        let q = Quat::yaw(90.0);
+        let f = q.rotate(AXES[2]);
+        assert!(f.dist(AXES[0]) < 1e-5, "{f:?}");
+        let r = yaw_pitch_rotation(30.0, 45.0);
+        let (fwd, _) = yaw_pitch_axes(30.0, 45.0);
+        assert!(r.rotate(AXES[2]).dist(fwd) < 1e-5);
+    }
+
+    #[test]
+    fn free_camera_rotation() {
+        let near = |a: V3, b: V3| a.dist(b) < 1e-4;
+        let (fwd, right) = yaw_pitch_axes(0.0, 0.0);
+        assert!(near(fwd, V3 { x: 0.0, y: 0.0, z: 1.0 }) && near(right, V3 { x: 1.0, y: 0.0, z: 0.0 }));
+        let (fwd, right) = yaw_pitch_axes(90.0, 0.0);
+        assert!(near(fwd, V3 { x: 1.0, y: 0.0, z: 0.0 }) && near(right, V3 { x: 0.0, y: 0.0, z: -1.0 }));
+        assert!(near(yaw_pitch_axes(0.0, 90.0).0, V3 { x: 0.0, y: -1.0, z: 0.0 })); // pitch > 0 looks down
+        let (yaw, pitch) = yaw_pitch_of(yaw_pitch_axes(30.0, -20.0).0);
+        assert!((yaw - 30.0).abs() < 1e-3 && (pitch + 20.0).abs() < 1e-3);
+        // The rotation set on the camera looks where the free camera moves.
+        let rotate = |q: Quat, v: V3| {
+            let (u, w) = (V3 { x: q.0[0], y: q.0[1], z: q.0[2] }, q.0[3]);
+            let t = u.cross(v).scale(2.0);
+            v.add_scaled(t, w).add_scaled(u.cross(t), 1.0)
+        };
+        for (yaw, pitch) in [(0.0, 0.0), (90.0, 0.0), (-135.0, 40.0), (200.0, -70.0)] {
+            let q = yaw_pitch_rotation(yaw, pitch);
+            let (fwd, right) = yaw_pitch_axes(yaw, pitch);
+            assert!(near(rotate(q, AXES[2]), fwd) && near(rotate(q, AXES[0]), right), "{yaw} {pitch}");
         }
     }
 
