@@ -13,7 +13,7 @@ use hudhook::windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 use crate::call;
-use crate::push::{pitch_down_deg, wall_from_hits, Frame, Pose, PushRecord, Split};
+use crate::push::{pitch_down_deg, start_position, wall_from_casts, Frame, Pose, PushRecord, Split, WALL_INSIDE};
 use crate::il2cpp::{self, alive, class, field, field_of, method, method_sig, rd, wr, M, P};
 
 #[repr(C)]
@@ -2412,14 +2412,26 @@ unsafe fn track_inspection(
                 Pose::Debout
             }
         });
-        // The wall behind: its near face going back, then its far face coming back from beyond it
-        // (a cast starting inside a collider doesn't see it).
+        // The wall behind (see wall_from_casts). A cast starting inside a collider doesn't see it:
+        // the near face is looked for from in front of the player (who may already be in the wall),
+        // what lies behind the wall from just inside it, and the far face coming back from there.
         const PROBE: f32 = 3.0;
         let mask = collision_mask(g, layer, &[layer, INSPECT_LAYER]);
         let back = frame.fwd.scale(-1.0);
-        let near = ray(g, from, back, s.push_wall_probe, mask);
-        let back_hit = near.and_then(|n| ray(g, from.add_scaled(back, n + PROBE), frame.fwd, PROBE, mask));
-        let start = Some(snapshot(g, s, ctrl, tr, stats, inv, carried));
+        let offset = radius + 0.3;
+        let front_hit = ray(g, from.add_scaled(frame.fwd, offset), back, s.push_wall_probe + offset, mask);
+        let (gap, return_hit) = match front_hit {
+            Some(h) => {
+                let inside = from.add_scaled(back, h - offset + WALL_INSIDE);
+                let gap = ray(g, inside, back, PROBE, mask);
+                let span = gap.map_or(PROBE, |g| WALL_INSIDE + g);
+                (gap, ray(g, from.add_scaled(back, h - offset + span), frame.fwd, span, mask))
+            },
+            None => (None, None),
+        };
+        let mut start = snapshot(g, s, ctrl, tr, stats, inv, carried);
+        start.pos = start_position(start.pos, center, from);
+        let start = Some(start);
         s.push_n += 1;
         s.push = Some(PushRecord {
             n: s.push_n,
@@ -2436,7 +2448,7 @@ unsafe fn track_inspection(
             open: Split::default(),
             max: 0.0,
             settled: None,
-            wall: wall_from_hits(near, back_hit, PROBE),
+            wall: wall_from_casts(front_hit, offset, gap, return_hit, PROBE),
             crossed: false,
             trail: vec![from],
             start,
@@ -2458,12 +2470,13 @@ unsafe fn track_inspection(
         p.trail.push(center);
     }
     if was_open && !inspecting {
-        p.closed.get_or_insert(now);
+        // Without a wall found behind, something solid crossed by the push is the only sign of a
+        // traversal (with one, the far face tells: a cast into a wall the player is stuck in hits it).
+        // Checked now, before the player walks off.
+        let crossed = p.wall.is_none() && blocked(g, p.from, center, layer);
+        p.close(now, crossed);
     }
     if p.closed.is_some_and(|t| now.duration_since(t).as_secs_f32() >= settle) {
-        // Without a wall found behind, something solid crossed on the way is the only sign of a
-        // traversal (with one, the far face tells: a cast into a wall the player is stuck in hits it).
-        p.crossed = p.wall.is_none() && blocked(g, p.from, center, layer);
         p.finish(center, now);
         archive_push(s);
     }
@@ -3069,6 +3082,10 @@ unsafe fn tick(g: &G, ctrl: P) {
             },
             Action::Load(_) => unreachable!("turned into LoadAt above"),
             Action::LoadAt(saved) => {
+                // A push still playing out would take its end result after the teleport: drop it.
+                if s.push.as_ref().is_some_and(|p| p.settled.is_none()) {
+                    s.push = None;
+                }
                 s.fly_pos = saved.pos;
                 teleport(g, ctrl, saved.pos, saved.rot, false);
                 wr(ctrl, g.off_look, saved.look);

@@ -81,11 +81,25 @@ impl Wall {
     }
 }
 
-/// `near`: first hit going backward. `back_hit`: first hit coming back from `near + probe` toward
-/// the player (the far face). No far face within the probe: the wall is at least `probe` thick.
-pub(crate) fn wall_from_hits(near: Option<f32>, back_hit: Option<f32>, probe: f32) -> Option<Wall> {
-    let near = near?;
-    Some(Wall { near, far: near + probe - back_hit.unwrap_or(0.0) })
+/// How far inside the near face the cast toward what lies behind the wall starts.
+pub(crate) const WALL_INSIDE: f32 = 0.01;
+
+/// The wall behind from three casts (a cast starting inside a collider doesn't see it):
+/// - `front_hit`: from `offset` in front of the capsule center, backward to the near face (the
+///   center may already be inside the wall on a second inspection);
+/// - `gap`: from WALL_INSIDE inside the near face, backward to the next obstacle (None within `probe`);
+/// - `return_hit`: from that obstacle (or `probe` behind the near face), back toward the player to the
+///   wall's far face. None: no far face found, the wall is at least that thick.
+pub(crate) fn wall_from_casts(front_hit: Option<f32>, offset: f32, gap: Option<f32>, return_hit: Option<f32>, probe: f32) -> Option<Wall> {
+    let near = front_hit? - offset;
+    let span = gap.map_or(probe, |g| WALL_INSIDE + g);
+    Some(Wall { near, far: near + span - return_hit.unwrap_or(0.0) })
+}
+
+/// Where the body was before the push, from where it is now and how far the capsule moved: the
+/// push may already have happened on the frame the inspection is seen open.
+pub(crate) fn start_position(body_now: V3, center_now: V3, center_before: V3) -> V3 {
+    body_now.sub(center_now.sub(center_before))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -168,6 +182,15 @@ pub(crate) struct PushRecord {
 }
 
 impl PushRecord {
+    /// The inspection closed: when, and whether something solid lay between the start and the body
+    /// then. Only the first call counts (later the player may walk anywhere).
+    pub(crate) fn close(&mut self, at: Instant, crossed: bool) {
+        if self.closed.is_none() {
+            self.closed = Some(at);
+            self.crossed = crossed;
+        }
+    }
+
     /// Takes the end result once; later calls keep the first one.
     pub(crate) fn finish(&mut self, now_center: V3, closed: Instant) {
         if self.settled.is_none() {
@@ -257,10 +280,10 @@ mod tests {
 
     #[test]
     fn wall_geometry() {
-        let w = wall_from_hits(Some(0.3), Some(2.6), 3.0).unwrap();
+        let w = wall_from_casts(Some(0.3), 0.0, None, Some(2.6), 3.0).unwrap();
         assert!((w.far - 0.7).abs() < 1e-5 && (w.thickness() - 0.4).abs() < 1e-5);
-        assert!(wall_from_hits(None, Some(1.0), 3.0).is_none());
-        assert!((wall_from_hits(Some(0.3), None, 3.0).unwrap().far - 3.3).abs() < 1e-5);
+        assert!(wall_from_casts(None, 0.0, None, Some(1.0), 3.0).is_none());
+        assert!((wall_from_casts(Some(0.3), 0.0, None, None, 3.0).unwrap().far - 3.3).abs() < 1e-5);
     }
 
     #[test]
@@ -308,6 +331,48 @@ mod tests {
         );
         r.wall = None;
         assert!(!r.hud().contains("dans le mur"));
+    }
+
+    #[test]
+    fn close_keeps_first_crossing() {
+        let f = Frame::from_camera_right(V3 { x: 1.0, y: 0.0, z: 0.0 });
+        let mut r = PushRecord::new_for_test(V3::default(), f, None);
+        let t0 = Instant::now();
+        r.close(t0, true);
+        // walking away later must not change what was crossed when it closed
+        r.close(t0 + std::time::Duration::from_secs(1), false);
+        assert!(r.crossed && r.closed == Some(t0));
+        r.finish(V3 { x: 5.0, y: 0.0, z: 0.0 }, Instant::now());
+        assert!(r.crossed);
+    }
+
+    #[test]
+    fn start_slot_is_before_the_push() {
+        // log n=1 : corps lu a z 11.846 juste apres l'ouverture, 11.548 avant la poussee
+        let body_now = V3 { x: -6.462, y: -24.99, z: 11.846 };
+        let (center_before, center_now) = (V3 { x: -6.46, y: -24.7, z: 11.55 }, V3 { x: -6.46, y: -24.7, z: 11.848 });
+        let p = start_position(body_now, center_now, center_before);
+        assert!((p.z - 11.548).abs() < 1e-3 && (p.x - body_now.x).abs() < 1e-6, "{p:?}");
+    }
+
+    #[test]
+    fn wall_seen_from_inside() {
+        // 2e inspection : le centre est deja 0,05 m derriere la face avant ; on sonde depuis 0,6 m devant
+        let w = wall_from_casts(Some(0.55), 0.6, None, Some(2.6), 3.0).unwrap();
+        assert!((w.near + 0.05).abs() < 1e-5, "{w:?}");
+        assert!((w.thickness() - 0.4).abs() < 1e-5);
+        assert!(wall_from_casts(None, 0.6, None, None, 3.0).is_none());
+    }
+
+    #[test]
+    fn far_face_ignores_what_lies_behind() {
+        // mur de 0,4 m, puis un autre mur 1 m derriere : depuis l'interieur (near + 0,01) on touche
+        // l'autre mur a 0,39 + 1,0 = 1,39 ; en revenant de la, la face arriere est a 1,0
+        let w = wall_from_casts(Some(0.3), 0.0, Some(1.39), Some(1.0), 3.0).unwrap();
+        assert!((w.far - 0.7).abs() < 1e-5, "{w:?}");
+        // rien derriere dans les 3 m : retour depuis near + 3
+        let w = wall_from_casts(Some(0.3), 0.0, None, Some(2.6), 3.0).unwrap();
+        assert!((w.far - 0.7).abs() < 1e-5);
     }
 
     #[test]
