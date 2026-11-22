@@ -23,7 +23,7 @@ use hudhook::windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetW
 use hudhook::{Hudhook, ImguiRenderLoop, MessageFilter, RenderContext};
 
 use game::{
-    lineup, lock, spot_count, spread, Action, Outcome, Repeat, Side, FLOAT_COLOR, GOD, INF_ITEMS, NOCLIP,
+    lineup, lock, spot_count, spread, Action, Outcome, Repeat, Side, FLOAT_COLOR, FX_NAMES, GOD, INF_ITEMS, NOCLIP,
     NO_FALL_TP, TURNS, UNLOCK_LEVELS,
 };
 
@@ -71,9 +71,9 @@ impl Overlay {
                     "entites" => s.freeze_entities = !s.freeze_entities,
                     "sauver" => s.actions.push(Action::Save),
                     "charger" => s.actions.push(Action::Load(s.selected)),
-                    "effets_off" => s.fx_off = !s.fx_off,
+                    "effets_off" => s.toggle_fx_all(),
                     "colliders" => s.show_colliders = !s.show_colliders,
-                    "triggers" => s.show_triggers = !s.show_triggers,
+                    "triggers" => s.toggle_zones(),
                     "stamina" => s.inf_stamina = !s.inf_stamina,
                     "items_infinis" => flip(&INF_ITEMS),
                     "anti_chute_off" => flip(&NO_FALL_TP),
@@ -227,7 +227,16 @@ impl ImguiRenderLoop for Overlay {
                     if ui.small_button("1x") {
                         s.time_scale = 1.0;
                     }
-                    ui.checkbox(format!("Effets VHS / camera off{}", hk(6)), &mut s.fx_off);
+                    let all = s.fx_all_cut();
+                    if ui.button(format!("{}{}", if all { "Tout remettre" } else { "Tout couper" }, hk(6))) {
+                        s.toggle_fx_all();
+                    }
+                    ui.same_line();
+                    ui.text_disabled("effets de camera, un par un :");
+                    for (i, name) in FX_NAMES.iter().enumerate() {
+                        ui.checkbox(format!("Couper : {name}"), &mut s.fx_cut[i]);
+                    }
+                    ui.checkbox("Couper : VHS du jeu", &mut s.fx_game_vhs);
                     ui.checkbox("Post-process du niveau off", &mut s.level_post_off);
                     ui.slider("Luminosite (EV)", 0.0, 8.0, &mut s.brightness);
                     atomic_checkbox(ui, "Debloquer tous les niveaux (selection de niveau)", &UNLOCK_LEVELS);
