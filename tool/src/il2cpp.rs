@@ -46,6 +46,7 @@ api! {
     method_get_param_count(P) -> u32;
     method_get_param(P, u32) -> P;
     method_is_generic(P) -> bool;
+    method_get_flags(P, *mut u32) -> u32;
     class_get_fields(P, *mut P) -> P;
     field_get_name(P) -> *const c_char;
     field_get_flags(P) -> i32;
@@ -139,6 +140,13 @@ pub unsafe fn method_sig(klass: P, name: &str, params: &[&str]) -> Result<M, Str
             return Ok(M(ptr, mi as usize));
         }
     }
+}
+
+const METHOD_ATTRIBUTE_STATIC: u32 = 0x10;
+
+/// Whether a resolved method is static (no `this` before its parameters).
+pub unsafe fn is_static(m: M) -> bool {
+    ((api().method_get_flags)(m.1 as P, std::ptr::null_mut()) & METHOD_ATTRIBUTE_STATIC) != 0
 }
 
 /// The System.Type object of a class, for Unity APIs taking a Type.
