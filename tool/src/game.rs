@@ -24,24 +24,28 @@ pub struct V3 {
 }
 
 impl V3 {
-    fn add_scaled(self, o: V3, k: f32) -> V3 {
+    pub(crate) fn add_scaled(self, o: V3, k: f32) -> V3 {
         V3 { x: self.x + o.x * k, y: self.y + o.y * k, z: self.z + o.z * k }
     }
 
-    fn sub(self, o: V3) -> V3 {
+    pub(crate) fn sub(self, o: V3) -> V3 {
         self.add_scaled(o, -1.0)
     }
 
-    fn scale(self, k: f32) -> V3 {
+    pub(crate) fn scale(self, k: f32) -> V3 {
         V3::default().add_scaled(self, k)
     }
 
-    fn dot(self, o: V3) -> f32 {
+    pub(crate) fn dot(self, o: V3) -> f32 {
         self.x * o.x + self.y * o.y + self.z * o.z
     }
 
-    fn cross(self, o: V3) -> V3 {
+    pub(crate) fn cross(self, o: V3) -> V3 {
         V3 { x: self.y * o.z - self.z * o.y, y: self.z * o.x - self.x * o.z, z: self.x * o.y - self.y * o.x }
+    }
+
+    pub(crate) fn len(self) -> f32 {
+        self.dot(self).sqrt()
     }
 
     pub fn dist(self, o: V3) -> f32 {

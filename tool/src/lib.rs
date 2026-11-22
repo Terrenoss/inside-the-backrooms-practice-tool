@@ -2,6 +2,7 @@
 // (hudhook) and drives the game through its own il2cpp methods (see game.rs).
 mod config;
 mod game;
+mod push;
 mod il2cpp;
 
 use std::ffi::c_void;
