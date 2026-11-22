@@ -175,8 +175,9 @@ impl ImguiRenderLoop for Overlay {
                         let way = if turn >= 0.0 { "a droite" } else { "a gauche" };
                         ui.text(format!("Line up : tourne de {:.0} deg {way} (vise {:.0}, toi {:.0})", turn.abs(), l.yaw, s.yaw));
                     }
-                    if let Some(v) = s.push_recent().and_then(|p| p.verdict()) {
-                        ui.text_colored(v.color(), format!("Inspection : {}", v.label()));
+                    if let Some(p) = s.push_recent() {
+                        let color = p.verdict().map_or([1.0; 4], |v| v.color());
+                        ui.text_colored(color, format!("Inspection {}", p.hud()));
                     }
                     if let Some(l) = s.landed.filter(|l| l.recent()) {
                         ui.text_colored(l.color(), format!("Bouee lachee : {}", l.label()));
@@ -402,8 +403,79 @@ impl ImguiRenderLoop for Overlay {
                     }
                     ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : la poussee a traverse un mur");
                     ui.text_colored([1.0, 0.6, 0.1, 1.0], "orange : poussee sans traverser");
-                    if let Some(v) = s.push.as_ref().and_then(|p| p.verdict()) {
-                        ui.text_colored(v.color(), format!("Derniere : {}", v.label()));
+                    ui.separator();
+                    ui.text("Mesure de la poussee");
+                    ui.checkbox("Capsule de depart", &mut s.show_push_ghost);
+                    ui.same_line();
+                    ui.checkbox("Capsule apres", &mut s.show_push_body);
+                    ui.checkbox("Fleche", &mut s.show_push_arrow);
+                    ui.same_line();
+                    ui.checkbox("Trajet", &mut s.show_push_trail);
+                    ui.same_line();
+                    ui.checkbox("Faces du mur", &mut s.show_push_wall);
+                    ui.checkbox("Copie reelle pendant l'inspection", &mut s.show_push_copy);
+                    ui.slider("Bilan apres (s)", 0.5, 5.0, &mut s.push_settle);
+                    ui.slider("Chercher le mur jusqu'a (m)", 0.5, 3.0, &mut s.push_wall_probe);
+                    let mut max = s.push_log_max as i32;
+                    if ui.slider("Lignes d'historique", 5, 100, &mut max) {
+                        s.push_log_max = max.clamp(5, 100) as usize;
+                    }
+                    ui.text_disabled("Regard = degres sous l'horizon (90 = le sol). Carte = ton");
+                    ui.text_disabled("orientation dans le niveau. Recul / monte en metres.");
+                    ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : A TRAVERSE");
+                    ui.same_line();
+                    ui.text_colored([1.0, 0.85, 0.2, 1.0], "jaune : reste en arriere");
+                    ui.text_colored([1.0, 0.6, 0.1, 1.0], "orange : recrache");
+                    ui.same_line();
+                    ui.text_colored([1.0, 0.25, 0.25, 1.0], "rouge : te fait monter");
+                    if let Some(p) = &s.push {
+                        let color = p.verdict().map_or([1.0; 4], |v| v.color());
+                        ui.text_colored(color, format!("Derniere : {}", p.hud()));
+                    }
+                    ui.text(format!("Historique ({})", s.push_log.len()));
+                    if !s.push_log.is_empty() {
+                        ui.same_line();
+                        if ui.small_button("Effacer") {
+                            s.push_log.clear();
+                        }
+                    }
+                    let (mut to_slot, mut go) = (None, None);
+                    ui.child_window("push_log").size([0.0, 200.0]).horizontal_scrollbar(true).build(|| {
+                        for (i, p) in s.push_log.iter().enumerate().rev() {
+                            let _id = ui.push_id_usize(i);
+                            if p.start.is_some() {
+                                if ui.small_button("Slot") {
+                                    to_slot = Some(i);
+                                }
+                                ui.same_line();
+                                if ui.small_button("Aller") {
+                                    go = Some(i);
+                                }
+                                ui.same_line();
+                            }
+                            let (color, verdict) = p.verdict().map_or(([1.0; 4], ""), |v| (v.color(), v.label()));
+                            let settled = p.settled.map_or(0.0, |st| st.back);
+                            ui.text_colored(
+                                color,
+                                format!(
+                                    "#{} {} | carte {:.0} regard {:.0} {} | ouv. recul {:.2} monte {:.2} | bilan {:.2} | {verdict}",
+                                    p.n,
+                                    p.item,
+                                    p.yaw,
+                                    p.pitch,
+                                    p.pose.label(),
+                                    p.open.back,
+                                    p.open.up,
+                                    settled
+                                ),
+                            );
+                        }
+                    });
+                    if let Some(saved) = to_slot.and_then(|i| s.push_log[i].start.clone()) {
+                        s.slots.push(saved);
+                    }
+                    if let Some(saved) = go.and_then(|i| s.push_log[i].start.clone()) {
+                        s.actions.push(Action::LoadAt(saved));
                     }
                 }
 
