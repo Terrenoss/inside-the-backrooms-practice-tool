@@ -1,6 +1,8 @@
 // Inspect glitch push: the pure part of the measurement (player frame, how a move splits into back /
 // up / side, the wall behind, the verdict). game.rs does the reading and the drawing.
-use crate::game::V3;
+use std::time::Instant;
+
+use crate::game::{Saved, V3};
 
 /// The player's horizontal frame, from the camera's right vector: unlike its forward one, it stays
 /// horizontal and defined when looking straight down (the inspect glitch is done looking at the floor).
@@ -136,6 +138,78 @@ pub(crate) fn verdict(open: Split, settled: Split, wall: Option<&Wall>, crossed:
     }
 }
 
+/// One inspection, from its opening until the push played out (`push_settle` after closing).
+#[derive(Clone)]
+pub(crate) struct PushRecord {
+    pub n: usize,
+    pub item: String,
+    /// Facing on the map and how far below the horizon the camera looked, degrees.
+    pub yaw: f32,
+    pub pitch: f32,
+    pub pose: Pose,
+    /// Capsule center before the push, its size, and the player's frame then.
+    pub from: V3,
+    pub radius: f32,
+    pub height: f32,
+    pub frame: Frame,
+    pub opened: Instant,
+    pub closed: Option<Instant>,
+    /// The push in the first moments after opening, the farthest the body went, and where it is
+    /// once the push played out.
+    pub open: Split,
+    pub max: f32,
+    pub settled: Option<Split>,
+    pub wall: Option<Wall>,
+    /// Something solid was crossed on the way (the merged branch's sphere cast check).
+    pub crossed: bool,
+    pub trail: Vec<V3>,
+    /// The player's state when it opened, to try it again from a slot.
+    pub start: Option<Saved>,
+}
+
+impl PushRecord {
+    /// Takes the end result once; later calls keep the first one.
+    pub(crate) fn finish(&mut self, now_center: V3, closed: Instant) {
+        if self.settled.is_none() {
+            self.settled = Some(self.frame.split(now_center.sub(self.from)));
+            self.closed.get_or_insert(closed);
+        }
+    }
+
+    /// How far the back of the capsule sits inside the wall (negative: still in front of it).
+    pub(crate) fn depth(&self, s: Split) -> Option<f32> {
+        self.wall.map(|w| s.back + self.radius - w.near)
+    }
+
+    pub(crate) fn verdict(&self) -> Option<Verdict> {
+        self.settled.map(|settled| verdict(self.open, settled, self.wall.as_ref(), self.crossed))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(from: V3, frame: Frame, wall: Option<Wall>) -> PushRecord {
+        PushRecord {
+            n: 0,
+            item: String::new(),
+            yaw: frame.yaw_deg(),
+            pitch: 0.0,
+            pose: Pose::Inconnue,
+            from,
+            radius: 0.0,
+            height: 0.0,
+            frame,
+            opened: Instant::now(),
+            closed: None,
+            open: Split::default(),
+            max: 0.0,
+            settled: None,
+            wall,
+            crossed: false,
+            trail: Vec::new(),
+            start: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +252,22 @@ mod tests {
         // passe la face arriere
         assert_eq!(verdict(sp(0.37, 0.0), sp(1.0, 0.0), Some(&wall), false), Verdict::Traverse);
         assert_eq!(verdict(sp(0.0, 0.0), sp(0.0, 0.0), Some(&wall), false), Verdict::Rien);
+    }
+
+    #[test]
+    fn new_open_finishes_previous_record() {
+        let f = Frame::from_camera_right(V3 { x: 1.0, y: 0.0, z: 0.0 }); // avant = +Z
+        let mut r = PushRecord::new_for_test(V3::default(), f, Some(Wall { near: 0.3, far: 0.9 }));
+        r.radius = 0.3;
+        r.finish(V3 { x: 0.0, y: 0.0, z: -0.27 }, Instant::now());
+        assert!((r.settled.unwrap().back - 0.27).abs() < 1e-5);
+        assert!(r.closed.is_some());
+        // un second finish (bilan deja pris) ne change rien
+        r.finish(V3::default(), Instant::now());
+        assert!((r.settled.unwrap().back - 0.27).abs() < 1e-5);
+        // l'arriere de la capsule est 0,27 + 0,3 - 0,3 = 0,27 m dans le mur
+        assert!((r.depth(r.settled.unwrap()).unwrap() - 0.27).abs() < 1e-5);
+        assert_eq!(r.verdict(), Some(Verdict::Reste));
     }
 
     #[test]

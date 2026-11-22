@@ -175,8 +175,8 @@ impl ImguiRenderLoop for Overlay {
                         let way = if turn >= 0.0 { "a droite" } else { "a gauche" };
                         ui.text(format!("Line up : tourne de {:.0} deg {way} (vise {:.0}, toi {:.0})", turn.abs(), l.yaw, s.yaw));
                     }
-                    if let Some(p) = s.push.filter(|p| p.recent()) {
-                        ui.text_colored(p.color(), format!("Inspection : {}", p.label()));
+                    if let Some(v) = s.push_recent().and_then(|p| p.verdict()) {
+                        ui.text_colored(v.color(), format!("Inspection : {}", v.label()));
                     }
                     if let Some(l) = s.landed.filter(|l| l.recent()) {
                         ui.text_colored(l.color(), format!("Bouee lachee : {}", l.label()));
@@ -402,8 +402,8 @@ impl ImguiRenderLoop for Overlay {
                     }
                     ui.text_colored([0.2, 1.0, 0.3, 1.0], "vert : la poussee a traverse un mur");
                     ui.text_colored([1.0, 0.6, 0.1, 1.0], "orange : poussee sans traverser");
-                    if let Some(p) = s.push {
-                        ui.text_colored(p.color(), format!("Derniere : {}", p.label()));
+                    if let Some(v) = s.push.as_ref().and_then(|p| p.verdict()) {
+                        ui.text_colored(v.color(), format!("Derniere : {}", v.label()));
                     }
                 }
 

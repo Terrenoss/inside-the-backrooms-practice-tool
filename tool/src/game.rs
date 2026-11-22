@@ -13,6 +13,7 @@ use hudhook::windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 use crate::call;
+use crate::push::{pitch_down_deg, wall_from_hits, Frame, Pose, PushRecord, Split};
 use crate::il2cpp::{self, alive, class, field, field_of, method, method_sig, rd, wr, M, P};
 
 #[repr(C)]
@@ -509,54 +510,6 @@ pub fn lineup(s: &State) -> Option<Lineup> {
     })
 }
 
-/// How the player moved during the last item inspection (the inspect glitch).
-#[derive(Clone, Copy)]
-pub struct Push {
-    from: V3,
-    to: V3,
-    /// Horizontal facing when the inspection opened.
-    fwd: V3,
-    /// Something solid between where the player was and where they ended up.
-    crossed: bool,
-    radius: f32,
-    height: f32,
-    at: Instant,
-}
-
-impl Push {
-    pub fn recent(&self) -> bool {
-        self.at.elapsed() < PUSH_SHOWN
-    }
-
-    fn moved(&self) -> bool {
-        self.from.dist(self.to) >= 0.05
-    }
-
-    pub fn label(&self) -> String {
-        if !self.moved() {
-            return "pas pousse".into();
-        }
-        let d = self.to.sub(self.from);
-        let right = V3 { x: self.fwd.z, y: 0.0, z: -self.fwd.x };
-        let text = format!(
-            "pousse de {:.2} m (avant {:+.2}, droite {:+.2}, haut {:+.2})",
-            self.from.dist(self.to),
-            d.dot(self.fwd),
-            d.dot(right),
-            d.y
-        );
-        if self.crossed { text + " : A TRAVERSE" } else { text }
-    }
-
-    pub fn color(&self) -> [f32; 4] {
-        match (self.moved(), self.crossed) {
-            (false, _) => [0.7, 0.7, 0.7, 1.0],
-            (true, true) => [0.2, 1.0, 0.3, 1.0],
-            (true, false) => [1.0, 0.6, 0.1, 1.0],
-        }
-    }
-}
-
 pub struct Point {
     pub label: String,
     pub pos: V3,
@@ -678,7 +631,19 @@ pub struct State {
     pub inspect_item: String,
     /// Whether inspected items (INSPECT_LAYER) are solid for the player.
     pub inspect_solid: Option<bool>,
-    pub push: Option<Push>,
+    /// The inspection being measured, or the last one (see push.rs).
+    pub push: Option<PushRecord>,
+    /// Finished ones, the latest last, at most push_log_max.
+    pub push_log: Vec<PushRecord>,
+    pub push_log_max: usize,
+    /// Seconds after closing before taking the end result, how far back to look for the wall (m),
+    /// and for how many seconds after closing the last one stays drawn.
+    pub push_settle: f32,
+    pub push_wall_probe: f32,
+    pub push_shown: f32,
+    push_n: usize,
+    /// Whether an inspection was open last frame.
+    push_was_open: bool,
     pub show_colliders: bool,
     pub show_visible_walls: bool,
     pub show_triggers: bool,
@@ -757,9 +722,8 @@ pub struct State {
     inspect_shapes: Vec<(Mat4, Shape)>,
     /// Local player controller: a new one means a new level, whose unload freed the cached objects.
     controller: usize,
-    /// Player capsule (center, radius, height) last frame, and when the inspection opened.
+    /// Player capsule (center, radius, height) last frame.
     capsule: Option<(V3, f32, f32)>,
-    inspect_start: Option<(V3, V3)>,
 }
 
 pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
@@ -778,10 +742,22 @@ pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         skip_right: true,
         inspect_preview: true,
         inspect_fill: 0.3,
+        push_log_max: 30,
+        push_settle: 1.5,
+        push_wall_probe: 1.5,
+        push_shown: 15.0,
         line_width: 1.5,
         ..Default::default()
     })
 });
+
+impl State {
+    /// The push to show: being measured, or closed less than push_settle + push_shown seconds ago.
+    pub fn push_recent(&self) -> Option<&PushRecord> {
+        let shown = self.push_settle + self.push_shown;
+        self.push.as_ref().filter(|p| p.closed.is_none_or(|t| t.elapsed().as_secs_f32() < shown))
+    }
+}
 
 pub fn lock() -> MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
@@ -831,6 +807,8 @@ const ELEVATORS: [&str; 4] = ["MainElevator", "Elevator", "HotelElevator", "Lift
 const INSPECT_DISTANCE: f32 = 0.1;
 const INSPECT_LAYER: i32 = 30;
 const PUSH_SHOWN: Duration = Duration::from_secs(15);
+/// Seconds after an inspection opens during which the body's move counts as its push.
+const PUSH_OPEN_WINDOW: f32 = 0.15;
 /// How long a dropped float stays drawn (until picked up again).
 const DROPPED_SHOWN: Duration = Duration::from_secs(60);
 /// A dropped float's resting place is measured from LANDED_AFTER to LANDED_BY after the drop.
@@ -959,6 +937,8 @@ struct G {
     /// PlayerController inputs the free camera's keys must not reach: (InputMoveDir,
     /// InputRunningHold, m_WaitingToJumpRelease). None if a version renamed one.
     off_move_inputs: Option<(usize, usize, usize)>,
+    /// BasePlayerController (IsCrawling, IsCrouched) backing fields, None if renamed.
+    off_pose: Option<(usize, usize)>,
     off_look_speed: usize,
     off_fx: Vec<usize>,
     off_color_adj: usize,
@@ -1179,6 +1159,9 @@ unsafe fn resolve() -> Result<G, String> {
         off_invuln: f(stats, "m_HasInvulnerability")?,
         off_spawned: f(ents, "SpawnedEntities")?,
         off_look_dir: f(pc, "InputLookDir")?,
+        off_pose: f(bpc, "<IsCrawling>k__BackingField")
+            .and_then(|c| Ok((c, f(bpc, "<IsCrouched>k__BackingField")?)))
+            .ok(),
         off_move_inputs: f(pc, "InputMoveDir")
             .and_then(|m| Ok((m, f(pc, "InputRunningHold")?, f(pc, "m_WaitingToJumpRelease")?)))
             .ok(),
@@ -2024,7 +2007,7 @@ unsafe fn draw(g: &G, s: &mut State, cam: P) {
     s.polys.clear();
     s.labels.clear();
     let hitboxes = s.show_colliders || s.show_triggers || s.show_exits;
-    let inspect = s.inspect_preview && !s.inspect_shapes.is_empty() || s.push.is_some_and(|p| p.recent());
+    let inspect = s.inspect_preview && !s.inspect_shapes.is_empty() || s.push_recent().is_some();
     // From the free camera, the player's own body usually isn't drawn: show where it is.
     let body = s.capsule.filter(|_| s.applied_free_cam);
     // s.floats is rescanned every second and emptied on level change: a float still in it is safe.
@@ -2368,7 +2351,14 @@ unsafe fn blocked(g: &G, from: V3, to: V3, player_layer: i32) -> bool {
 
 /// Follows the game's item inspection: copies the item's shape for the preview and measures the push.
 /// `before`: the player capsule last frame.
-unsafe fn track_inspection(g: &G, ins: &Inspection, s: &mut State, cc: P, before: Option<(V3, f32, f32)>) {
+unsafe fn track_inspection(
+    g: &G,
+    ins: &Inspection,
+    s: &mut State,
+    cc: P,
+    before: Option<(V3, f32, f32)>,
+    (ctrl, tr, stats, inv, carried): (P, P, P, P, Option<P>),
+) {
     let ui = call!(ins.singleton, fn() -> P);
     let Some((center, radius, height)) = s.capsule else { return };
     if !alive(ui) || !alive(cc) {
@@ -2376,30 +2366,114 @@ unsafe fn track_inspection(g: &G, ins: &Inspection, s: &mut State, cc: P, before
     }
     let layer = call!(g.go_layer, fn(P) -> i32, call!(g.comp_gameobject, fn(P) -> P, cc));
     s.inspect_solid = Some(!call!(g.ignore_layers, fn(i32, i32) -> bool, layer, INSPECT_LAYER));
-    if call!(ins.is_inspecting, fn() -> bool) {
-        if s.inspect_start.is_none() {
-            // Opening frame: the pivot is still where ShowInspectable put it, unrotated.
-            let (item, pivot): (P, P) = (rd(ui, ins.off_current), rd(ui, ins.off_pivot));
-            if alive(item) && alive(pivot) {
-                s.inspect_item = name_of(g, item);
-                s.inspect_shapes = item_shapes(g, item, pivot);
-            }
-            // Last frame's position: the push may already have happened this frame.
-            let from = before.map_or(center, |c| c.0);
-            let cam = call!(g.player_camera, fn() -> P);
-            let f = if alive(cam) {
-                call!(g.tr_forward, fn(P) -> V3, call!(g.comp_transform, fn(P) -> P, cam))
-            } else {
-                V3::default()
-            };
-            let flat = V3 { y: 0.0, ..f };
-            s.inspect_start = Some((from, flat.scale(1.0 / flat.dot(flat).sqrt().max(1e-6))));
+    let now = Instant::now();
+    let inspecting = call!(ins.is_inspecting, fn() -> bool);
+    // Last frame's position: the push may already have happened this frame.
+    let from = before.map_or(center, |c| c.0);
+    if inspecting && !s.push_was_open {
+        // A new inspection before the last one played out: take its end result from before this push.
+        if let Some(p) = s.push.as_mut() {
+            p.finish(from, now);
         }
-    } else if let Some((from, fwd)) = s.inspect_start.take() {
-        // First frame after closing it.
-        let crossed = blocked(g, from, center, layer);
-        s.push = Some(Push { from, to: center, fwd, crossed, radius, height, at: Instant::now() });
+        archive_push(s);
+        // Opening frame: the pivot is still where ShowInspectable put it, unrotated.
+        let (item, pivot): (P, P) = (rd(ui, ins.off_current), rd(ui, ins.off_pivot));
+        if alive(item) && alive(pivot) {
+            s.inspect_item = name_of(g, item);
+            s.inspect_shapes = item_shapes(g, item, pivot);
+        }
+        let cam = call!(g.player_camera, fn() -> P);
+        let (fwd, right) = if alive(cam) {
+            let t = call!(g.comp_transform, fn(P) -> P, cam);
+            (call!(g.tr_forward, fn(P) -> V3, t), call!(g.tr_right, fn(P) -> V3, t))
+        } else {
+            (V3 { x: 0.0, y: 0.0, z: 1.0 }, V3 { x: 1.0, y: 0.0, z: 0.0 })
+        };
+        let frame = Frame::from_camera_right(right);
+        let pose = g.off_pose.map_or(Pose::Inconnue, |(crawl, crouch)| {
+            if rd::<bool>(ctrl, crawl) {
+                Pose::Allonge
+            } else if rd::<bool>(ctrl, crouch) {
+                Pose::Accroupi
+            } else {
+                Pose::Debout
+            }
+        });
+        // The wall behind: its near face going back, then its far face coming back from beyond it
+        // (a cast starting inside a collider doesn't see it).
+        const PROBE: f32 = 3.0;
+        let mask = collision_mask(g, layer, &[layer, INSPECT_LAYER]);
+        let back = frame.fwd.scale(-1.0);
+        let near = ray(g, from, back, s.push_wall_probe, mask);
+        let back_hit = near.and_then(|n| ray(g, from.add_scaled(back, n + PROBE), frame.fwd, PROBE, mask));
+        let start = Some(snapshot(g, s, ctrl, tr, stats, inv, carried));
+        s.push_n += 1;
+        s.push = Some(PushRecord {
+            n: s.push_n,
+            item: s.inspect_item.clone(),
+            yaw: frame.yaw_deg(),
+            pitch: pitch_down_deg(fwd),
+            pose,
+            from,
+            radius,
+            height,
+            frame,
+            opened: now,
+            closed: None,
+            open: Split::default(),
+            max: 0.0,
+            settled: None,
+            wall: wall_from_hits(near, back_hit, PROBE),
+            crossed: false,
+            trail: vec![from],
+            start,
+        });
     }
+    let (settle, was_open) = (s.push_settle, s.push_was_open);
+    s.push_was_open = inspecting;
+    let Some(p) = s.push.as_mut().filter(|p| p.settled.is_none()) else { return };
+    let d = center.sub(p.from);
+    // The push itself happens within a frame or two of the opening.
+    if now.duration_since(p.opened).as_secs_f32() <= PUSH_OPEN_WINDOW {
+        let split = p.frame.split(d);
+        if split.len() >= p.open.len() {
+            p.open = split;
+        }
+    }
+    p.max = p.max.max(d.len());
+    if p.trail.last().is_none_or(|l| l.dist(center) > 0.01) {
+        p.trail.push(center);
+    }
+    if was_open && !inspecting {
+        p.closed.get_or_insert(now);
+    }
+    if p.closed.is_some_and(|t| now.duration_since(t).as_secs_f32() >= settle) {
+        // Without a wall found behind, something solid crossed on the way is the only sign of a
+        // traversal (with one, the far face tells: a cast into a wall the player is stuck in hits it).
+        p.crossed = p.wall.is_none() && blocked(g, p.from, center, layer);
+        p.finish(center, now);
+        archive_push(s);
+    }
+}
+
+/// Copies the finished push into the history, once.
+fn archive_push(s: &mut State) {
+    if let Some(p) = s.push.as_ref().filter(|p| p.settled.is_some()) {
+        if s.push_log.last().is_none_or(|l| l.n != p.n) {
+            s.push_log.push(p.clone());
+            let over = s.push_log.len().saturating_sub(s.push_log_max.max(1));
+            s.push_log.drain(..over);
+        }
+    }
+}
+
+/// The player's state as a savestate.
+unsafe fn snapshot(g: &G, s: &State, ctrl: P, tr: P, stats: P, inv: P, carried: Option<P>) -> Saved {
+    let rot = call!(g.tr_get_rot, fn(P) -> Quat, tr);
+    let items = if alive(inv) { inventory(g, inv, &s.items) } else { Vec::new() };
+    let float = carried.map_or(0, |f| f as usize);
+    let (look, boost) = (rd(ctrl, g.off_look), (rd(stats, g.off_boost), rd(stats, g.off_boost_timer)));
+    Saved { pos: s.pos, rot, stats: s.stats, items, float, look, boost }
 }
 
 /// The inspected item where inspecting now would put it, the player's capsule, the last push.
@@ -2444,14 +2518,15 @@ unsafe fn draw_inspect(g: &G, s: &mut State, vp: &Mat4) {
             }
         }
     }
-    if let Some(p) = s.push.filter(|p| p.recent()) {
-        let color = p.color();
-        world_line(&mut lines, vp, p.from, p.to, color);
-        for (a, b) in capsule_shape(p.to, p.radius, p.height, 1).edges {
+    if let Some(p) = s.push_recent() {
+        let to = *p.trail.last().unwrap_or(&p.from);
+        let color = p.verdict().map_or([1.0; 4], |v| v.color());
+        world_line(&mut lines, vp, p.from, to, color);
+        for (a, b) in capsule_shape(to, p.radius, p.height, 1).edges {
             world_line(&mut lines, vp, a, b, color);
         }
-        if let Some(at) = vp.project(p.to) {
-            labels.push((at, p.label(), color));
+        if let Some(at) = vp.project(to) {
+            labels.push((at, p.verdict().map_or("...", |v| v.label()).to_string(), color));
         }
     }
     s.lines.extend(lines);
@@ -2682,7 +2757,7 @@ unsafe fn tick(g: &G, ctrl: P) {
         s.controller = ctrl as usize;
         (s.colliders, s.infos, s.last_scan) = (Vec::new(), BTreeMap::new(), None);
         (s.floats, s.last_float_scan) = (Vec::new(), None);
-        (s.capsule, s.inspect_start) = (None, None);
+        (s.capsule, s.push, s.push_was_open) = (None, None, false);
         (s.cam_saved, s.applied_free_cam) = (None, false);
         (s.float_of_shapes, s.carried_last, s.dropped) = (0, 0, None);
     }
@@ -2884,8 +2959,9 @@ unsafe fn tick(g: &G, ctrl: P) {
     if let (Some(d), Some(body)) = (s.drop.as_mut(), s.capsule) {
         d.on_player = sphere_in_capsule(d.pos, d.radius, body);
     }
+    let inv = call!(g.player_inventory, fn() -> P);
     if let Some(ins) = &g.insp {
-        track_inspection(g, ins, s, cc, before);
+        track_inspection(g, ins, s, cc, before, (ctrl, tr, stats, inv, carried));
     }
     run_repeat(g, s, ctrl, tr, carried, identity, player_layer);
 
@@ -2910,7 +2986,6 @@ unsafe fn tick(g: &G, ctrl: P) {
         s.items.sort();
     }
 
-    let inv = call!(g.player_inventory, fn() -> P);
     for action in std::mem::take(&mut s.actions) {
         let action = match action {
             Action::Load(i) => match s.slots.get(i) {
@@ -2924,11 +2999,8 @@ unsafe fn tick(g: &G, ctrl: P) {
         };
         match action {
             Action::Save => {
-                let rot = call!(g.tr_get_rot, fn(P) -> Quat, tr);
-                let items = if alive(inv) { inventory(g, inv, &s.items) } else { Vec::new() };
-                let float = carried.map_or(0, |f| f as usize);
-                let (look, boost) = (rd(ctrl, g.off_look), (rd(stats, g.off_boost), rd(stats, g.off_boost_timer)));
-                s.slots.push(Saved { pos: s.pos, rot, stats: s.stats, items, float, look, boost });
+                let saved = snapshot(g, s, ctrl, tr, stats, inv, carried);
+                s.slots.push(saved);
                 s.selected = s.slots.len() - 1;
             },
             Action::Load(_) => unreachable!("turned into LoadAt above"),
@@ -3210,22 +3282,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_push_relative_to_facing() {
-        // Facing +X: right is -Z in Unity's left-handed axes.
-        let push = |to: V3, crossed| Push {
-            from: V3::default(),
-            to,
-            fwd: V3 { x: 1.0, y: 0.0, z: 0.0 },
-            crossed,
-            radius: 0.3,
-            height: 1.8,
-            at: Instant::now(),
-        };
-        let through = push(V3 { x: 0.8, y: 0.0, z: -0.1 }, true);
-        assert_eq!(through.label(), "pousse de 0.81 m (avant +0.80, droite +0.10, haut +0.00) : A TRAVERSE");
-        assert_eq!(through.color(), [0.2, 1.0, 0.3, 1.0]);
-        assert_eq!(push(V3 { x: -0.5, y: 0.0, z: 0.0 }, false).color(), [1.0, 0.6, 0.1, 1.0]);
-        assert_eq!(push(V3 { x: 0.01, y: 0.0, z: 0.0 }, true).label(), "pas pousse");
+    fn mat4_translation() {
         let p = Mat4::translation(V3 { x: 1.0, y: 2.0, z: 3.0 }).apply(V3 { x: 1.0, y: 1.0, z: 1.0 });
         assert_eq!(p, V3 { x: 2.0, y: 3.0, z: 4.0 });
     }
