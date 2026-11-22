@@ -117,8 +117,28 @@ anti-chute du jeu (5 s sans sol dessous), sommet de la bouée posée et options 
   - cyan : la forme réelle de l'objet, là où il apparaîtra si tu inspectes maintenant. Il faut
     l'avoir inspecté une fois pour que l'outil connaisse sa forme.
   - blanc : ta capsule de collision.
-  - Après chaque inspection, le HUD et le jeu affichent la poussée mesurée (distance, direction
-    avant/droite/haut). Vert si tu as traversé un mur, orange sinon.
+  - Curseurs « Remplissage de l'objet » et « Epaisseur des traits » pour mieux voir la forme.
+  - **Mesure de la poussée.** À chaque inspection, le HUD affiche une ligne du type
+    `#3 62 deg allonge | ouverture : recul 0.27 monte 0.00 cote +0.00 | bilan : recul 0.27 | dans le mur 12 cm / ep. 40 cm | reste en arriere`.
+    - « regard » : degrés sous l'horizon (90 = le sol).
+    - « ouverture » : la poussée dans les 0,15 s après l'ouverture.
+    - « bilan » : où tu es 1,5 s après la fermeture (réglable). Le mur peut te recracher entre-temps.
+    - Le mur derrière toi est cherché jusqu'à 1,5 m (réglable). Le tool donne son épaisseur et de
+      combien ta capsule est dedans.
+  - **Verdict :**
+    - vert : « A TRAVERSE » ;
+    - jaune : « reste en arriere » ;
+    - orange : « recrache » ;
+    - rouge : « te fait monter » ;
+    - gris : « pas pousse » ou « pas de mur derriere ».
+  - **Dessins, chacun avec sa case :** capsule de départ (gris), capsule après (couleur du
+    verdict), flèche, trajet du corps, faces du mur, copie réelle de l'objet pendant l'inspection.
+  - **Historique des essais :** numéro, objet, orientation, regard, pose, chiffres, verdict.
+    - « Slot » sauve la position de départ de l'essai comme savestate.
+    - « Aller » t'y remet.
+    - « Effacer » vide la liste.
+  - **Caméra libre (F11) :** ZQSD / Shift / Espace bougent seulement la caméra. Le perso reste
+    soumis au jeu (poussée, gravité, s'allonger), et l'aperçu reste devant sa vraie tête.
 - **Positions (savestates)** : sauve position, rotation, angle vertical de la caméra, vie / stamina /
   oxygène / anxiété, effet de la gelée et inventaire. Une savestate faite en portant la bouée te la
   remet dans les mains au chargement (slot marqué « + bouee », « + gelee » sous la gelée).
